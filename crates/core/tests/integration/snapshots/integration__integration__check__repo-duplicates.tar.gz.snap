@@ -1,7 +1,0 @@
----
-source: crates/core/tests/integration/check.rs
-expression: check_results
----
-CheckResults(
-    [],
-)

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap},
@@ -458,7 +459,7 @@ impl IntoIterator for Tree {
 }
 
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
-#[derive(Clone, Debug, Setters)]
+#[derive(Clone, Debug, Setters, Serialize, Deserialize)]
 #[setters(into)]
 #[non_exhaustive]
 /// Options for listing the `Nodes` of a `Tree`

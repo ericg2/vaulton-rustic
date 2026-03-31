@@ -55,7 +55,8 @@ This crate exposes a few features for controlling dependency usage:
 // formatting args are used for error messages
 #![allow(clippy::literal_string_with_formatting_args)]
 
-pub mod choose;
+pub mod repo_be;
+pub mod data_be;
 /// Local backend for Rustic.
 pub mod local;
 /// Utility functions for the backend.
@@ -69,12 +70,13 @@ pub mod opendal;
 #[cfg(feature = "rclone")]
 pub mod rclone;
 
+pub mod filters;
+pub mod repo;
 /// REST backend for Rustic.
 #[cfg(feature = "rest")]
 pub mod rest;
-
-#[cfg(feature = "opendal")]
-pub use crate::opendal::OpenDALBackend;
+pub mod services;
+pub mod arbhx;
 
 #[cfg(feature = "rclone")]
 pub use crate::rclone::RcloneBackend;
@@ -82,11 +84,12 @@ pub use crate::rclone::RcloneBackend;
 #[cfg(feature = "rest")]
 pub use crate::rest::RestBackend;
 
+pub use crate::repo::RepoVfsBackend;
+
 // rustic_backend Public API
-pub use crate::{
-    choose::{BackendOptions, SupportedBackend},
-    local::LocalBackend,
-};
+pub use crate::repo_be::{BackendOptions, SupportedBackend};
+
+pub use crate::services::{PointSource};
 
 // re-export for error handling
 pub use rustic_core::{ErrorKind, RusticError, RusticResult, Severity, Status};

@@ -20,5 +20,3 @@ rustic_config - library for configuration support in rustic-rs
 
 [dependencies]
 
-[lints]
-workspace = true

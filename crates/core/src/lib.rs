@@ -121,15 +121,19 @@ pub(crate) mod repository;
 pub mod vfs;
 pub(crate) mod cancel;
 
+use std::io;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 // rustic_core Public API
 pub use crate::{
     backend::{
-        ALL_FILE_TYPES, FileType, ReadBackend, ReadSource, ReadSourceEntry, ReadSourceOpen,
-        RepositoryBackends, WriteBackend,
+        ALL_FILE_TYPES, FileType, ReadBackend, DataLister, DataIterator,
+        RepositoryBackends, WriteBackend, DataBackends,
         decrypt::{compression_level_range, max_compression_level},
-        ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
-        local_destination::LocalDestination,
+        filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions},
+        node::{ExtMetadata, Metadata, Node, NodeType},
         node::last_modified_node,
+        data::{DataLocation, VfsReader, DataReadWrite, FileOpHandle, SeqWrite, DataRead, VfsWriter, DataFile, UsageStat},
     },
     blob::{
         BlobId, DataId, PackedId,
@@ -145,7 +149,7 @@ pub use crate::{
         prune::{LimitOption, PruneOptions, PrunePlan, PruneStats},
         repair::{index::RepairIndexOptions, snapshots::RepairSnapshotsOptions},
         repoinfo::{BlobInfo, IndexInfos, PackInfo, RepoFileInfo, RepoFileInfos},
-        restore::{FileDirStats, RestoreOptions, RestorePlan, RestoreStats},
+        restore::{FileDirStats, RestoreOptions, RestorePlan, RestoreStats, RestoreBias},
     },
     error::{ErrorKind, RusticError, RusticResult, Severity, Status, RusticJobError, RusticJobResult},
     id::{HexId, Id},
@@ -155,8 +159,40 @@ pub use crate::{
     },
     repository::{
         FullIndex, IdIndex, IndexedFull, IndexedIds, IndexedStatus, IndexedTree, Open, OpenStatus,
-        Repository, RepositoryOptions,
+        Repository, RepositoryOptions, RepoIndexed,
         command_input::{CommandInput, CommandInputErrorKind},
     },
-    cancel::*
+    cancel::*,
 };
+
+pub fn join_force(base: impl AsRef<Path>, p: impl AsRef<Path>) -> PathBuf {
+    let mut out = PathBuf::from(base.as_ref());
+    for comp in p.as_ref().components() {
+        match comp {
+            Component::Prefix(_) => {} // skip drive letters / UNC prefix
+            Component::RootDir => {}   // skip leading /
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+pub fn read_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0; len];
+    let mut total = 0;
+    while total < len {
+        let n = reader.read(&mut buf[total..])?;
+        if n == 0 {
+            break; // EOF
+        }
+        total += n;
+    }
+
+    buf.truncate(total);
+    Ok(buf)
+}

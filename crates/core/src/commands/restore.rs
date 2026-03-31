@@ -3,48 +3,98 @@
 use derive_setters::Setters;
 use log::{debug, error, info, trace, warn};
 
+use crate::backend::data::DataLocation;
+use crate::blob::Blob;
+use crate::blob::tree::TreeStreamerOptions;
+use crate::cancel::JobCancelToken;
+use crate::error::RusticJobResult;
+use crate::repository::NodeIterator;
+use crate::{DataBackends, DataFile, FileOpHandle, Id, backend::{
+    FileType, ReadBackend,
+    decrypt::DecryptReadBackend,
+    node::{Node, NodeType},
+}, error::{ErrorKind, RusticError, RusticResult}, progress::{Progress, ProgressBars}, repofile::packfile::PackId, repository::{IndexedFull, IndexedTree, Open, Repository}, RepoFilterOptions};
+use crate::{LsOptions, join_force};
+use bytes::Bytes;
+use chrono::{DateTime, Local, Utc};
+use ignore::{DirEntry, WalkBuilder};
+use itertools::Itertools;
+use rayon::{Scope, ThreadPoolBuilder};
+use serde_derive::{Deserialize, Serialize};
+use serde_with::serde_as;
+use std::fmt::Debug;
+use std::fs::File;
+use std::io::{Read, SeekFrom, Write};
+use std::path::Component;
+use std::sync::Arc;
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
+    io,
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
-use chrono::{DateTime, Local, Utc};
-use ignore::{DirEntry, WalkBuilder};
-use itertools::Itertools;
-use rayon::{Scope, ThreadPoolBuilder};
-
-use crate::{
-    backend::{
-        FileType, ReadBackend,
-        decrypt::DecryptReadBackend,
-        local_destination::LocalDestination,
-        node::{Node, NodeType},
-    },
-    error::{ErrorKind, RusticError, RusticResult},
-    progress::{Progress, ProgressBars},
-    repofile::packfile::PackId,
-    repository::{IndexedFull, IndexedTree, Open, Repository},
-};
-use crate::cancel::JobCancelToken;
-use crate::error::RusticJobResult;
-
 pub(crate) mod constants {
     /// The maximum number of reader threads to use for restoring.
     pub(crate) const MAX_READER_THREADS_NUM: usize = 20;
-    /// The maximum size of pack-part which is read at once from the backend.
-    /// (needed to limit the memory size used for large backends)
-    pub(crate) const LIMIT_PACK_READ: u32 = 40 * 1024 * 1024; // 40 MiB
 }
 
 type RestoreInfo = BTreeMap<(PackId, BlobLocation), Vec<FileLocation>>;
 type Filenames = Vec<PathBuf>;
 
+/// Determines which network cost the restore process should favor when deciding
+/// how to handle existing files at the destination.
+///
+/// This influences whether the restore planner prefers verifying existing data
+/// (which requires downloading parts of files) or rewriting files entirely
+/// (which requires uploading more data).
+///
+/// This is primarily relevant for object storage backends where downloads and
+/// uploads may have very different performance or cost characteristics.
+///
+/// Variants:
+///
+/// - `PreferDownloads`
+///   The restore process will attempt to verify existing files by reading
+///   portions of them (for example via range reads) and comparing them with the
+///   repository data. Only chunks that differ will be restored.
+///
+///   This results in **more downloads but fewer uploads**.
+///
+/// - `PreferUploads`
+///   The restore process will avoid verifying existing data and instead
+///   rewrite files that may have changed. This skips downloading file data
+///   for verification and restores the required chunks directly.
+///
+///   This results in **fewer downloads but potentially more uploads**.
+///
+/// The optimal choice depends on the storage backend and network conditions.
+/// For example, object storage services often make downloads expensive, making
+/// `PreferUploads` a reasonable default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+pub enum RestoreBias {
+    #[default]
+    /// Prefer downloading first. The default [`RestoreBias`] for all storage types.
+    PreferDownloads,
+
+    /// Prefer uploading first.
+    PreferUploads,
+}
+
+impl RestoreBias {
+    pub fn download() -> Self {
+        Self::PreferDownloads
+    }
+    pub fn upload() -> Self {
+        Self::PreferUploads
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
-#[derive(Debug, Copy, Clone, Default, Setters)]
+#[derive(Debug, Clone, Default, Setters, Serialize, Deserialize)]
 #[setters(into)]
 #[non_exhaustive]
 /// Options for the `restore` command
@@ -68,6 +118,10 @@ pub struct RestoreOptions {
     /// Always read and verify existing files (don't trust correct modification time and file size)
     #[cfg_attr(feature = "clap", clap(long))]
     pub verify_existing: bool,
+
+    /// If the restore is a DRY RUN, as in, no files get touched...
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub dry_run: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -114,20 +168,24 @@ pub struct RestoreStats {
 /// # Errors
 ///
 /// * If the restore failed.
-pub(crate) fn restore_repository<P: ProgressBars, S: IndexedTree>(
+pub(crate) fn restore_repository<P, S>(
     file_infos: RestorePlan,
     repo: &Repository<P, S>,
-    opts: RestoreOptions,
+    opts: &RestoreOptions,
     token: JobCancelToken,
     node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
-    dest: &LocalDestination,
-) -> RusticJobResult<()> {
+) -> RusticJobResult<()>
+where
+    P: ProgressBars,
+    S: IndexedTree,
+{
+    let dest = file_infos.be.clone();
     repo.warm_up_wait(file_infos.to_packs().into_iter())?;
     token.ensure_check()?; // *** final check before backing up...
-    restore_contents(repo, dest, token, file_infos)?;
+    restore_contents(repo, &dest, token, file_infos)?;
 
     let p = repo.pb.progress_spinner("setting metadata...");
-    restore_metadata(node_streamer, opts, dest)?;
+    //restore_metadata(node_streamer, opts, &dest)?; REMOVED 3-12-26
     p.finish();
 
     Ok(())
@@ -152,35 +210,39 @@ pub(crate) fn restore_repository<P: ProgressBars, S: IndexedTree>(
 /// * If a directory could not be created.
 /// * If the restore information could not be collected.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
+pub(crate) fn collect_and_prepare<P, S>(
     repo: &Repository<P, S>,
-    opts: RestoreOptions,
-    mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
-    dest: &LocalDestination,
+    opts: &RestoreOptions,
+    mut node_streamer: impl NodeIterator,
+    dest_be: &DataBackends,
+    dest_path: &Path,
     dry_run: bool,
     token: JobCancelToken,
-) -> RusticJobResult<RestorePlan> {
+) -> RusticJobResult<RestorePlan>
+where
+    P: ProgressBars,
+    S: IndexedFull,
+{
     let p = repo.pb.progress_spinner("collecting file information...");
-    let dest_path = dest.path("");
     token.ensure_good(&p)?;
 
+    let dest = dest_be.repository();
     let mut stats = RestoreStats::default();
-    let mut restore_infos = RestorePlan::default();
+    let mut restore_infos = RestorePlan::new(dest.clone(), dest_path);
     let mut additional_existing = false;
     let mut removed_dir = None;
-
-    let mut process_existing = |entry: &DirEntry| -> RusticResult<_> {
-        if entry.depth() == 0 {
+    let mut process_existing = |entry: &DataFile| -> RusticResult<_> {
+        if entry.path() == dest.get_backup_abs(dest_path) {
             // don't process the root dir which should be existing
             return Ok(());
         }
         debug!("additional {}", entry.path().display());
-        if entry.file_type().unwrap().is_dir() {
+        if entry.metadata().is_dir {
             stats.dirs.additional += 1;
         } else {
             stats.files.additional += 1;
         }
-        match (opts.delete, dry_run, entry.file_type().unwrap().is_dir()) {
+        match (opts.delete, dry_run, entry.metadata().is_dir) {
             (true, true, true) => {
                 info!(
                     "would have removed the additional dir: {}",
@@ -197,7 +259,7 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
                 let path = entry.path();
                 match &removed_dir {
                     Some(dir) if path.starts_with(dir) => {}
-                    _ => match dest.remove_dir(path) {
+                    _ => match dest.remove_dir(&path) {
                         Ok(()) => {
                             removed_dir = Some(path.to_path_buf());
                         }
@@ -208,7 +270,7 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
                 }
             }
             (true, false, false) => {
-                if let Err(err) = dest.remove_file(entry.path()) {
+                if let Err(err) = dest.remove_file(&entry.path()) {
                     error!("error removing {}: {err}", entry.path().display());
                 }
             }
@@ -230,14 +292,14 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
                     stats.dirs.restore += 1;
                     debug!("to restore: {}", path.display());
                     if !dry_run {
-                        dest.create_dir(path)
+                        dest.create_dir(&join_force(dest_path, path))
                             .map_err(|err| {
                                 RusticError::with_source(
                                     ErrorKind::InputOutput,
                                     "Failed to create the directory `{path}`. Please check the path and try again.",
-                                    err
+                                    err,
                                 )
-                                .attach_context("path", path.display().to_string())
+                                    .attach_context("path", path.display().to_string())
                             })?;
                     }
                 }
@@ -246,7 +308,14 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
                 // collect blobs needed for restoring
                 match (
                     exists,
-                    restore_infos.add_file(dest, node, path.clone(), repo, opts.verify_existing)?,
+                    restore_infos.add_file(
+                        dest_be,
+                        dest_path,
+                        node,
+                        path.clone(),
+                        repo,
+                        opts.verify_existing,
+                    )?,
                 ) {
                     // Note that exists = false and Existing or Verified can happen if the file is changed between scanning the dir
                     // and calling add_file. So we don't care about exists but trust add_file here.
@@ -276,22 +345,42 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
     };
 
     token.ensure_good(&p)?;
-    let mut dst_iter = WalkBuilder::new(dest_path)
-        .follow_links(false)
-        .hidden(false)
-        .ignore(false)
-        .sort_by_file_path(Path::cmp)
-        .build()
-        .inspect(|r| {
-            if let Err(err) = r {
-                error!("Error during collection of files: {err:?}");
-            }
-        })
+    // let mut dst_iter = WalkBuilder::new(dest_path)
+    //     .follow_links(false)
+    //     .hidden(false)
+    //     .ignore(false)
+    //     .sort_by_file_path(Path::cmp)
+    //     .build()
+    //     .inspect(|r| {
+    //         if let Err(err) = r {
+    //             error!("Error during collection of files: {err:?}");
+    //         }
+    //     })
+    //     .filter_map(Result::ok);
+
+    // First, make sure all folders exist for our restore point!
+    dest.create_dir(dest_path).map_err(|err| {
+        RusticError::with_source(
+            ErrorKind::InputOutput,
+            "Failed to create the `{dest_path}`.",
+            err,
+        )
+    })?;
+
+    let mut dst_iter = dest
+        .read_dir_filtered(dest_path, None, true) // NEEDS TO BE ABSOLUTE
+        .and_then(|x| x.get_iter())
+        .map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Failed to create read the `{dest_path}`. Please check the path and try again.",
+                err,
+            )
+        })?
         .filter_map(Result::ok);
 
     let mut next_dst = dst_iter.next();
     let mut next_node = node_streamer.next().transpose()?;
-
     loop {
         token.ensure_good(&p)?; // *** check for each directory... might be too much 1-12-26.
         match (&next_dst, &next_node) {
@@ -302,31 +391,39 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
                 next_dst = dst_iter.next();
             }
             (Some(destination), Some((path, node))) => {
-                match destination.path().cmp(&dest.path(path)) {
+                let abs_path = &dest.get_backup_abs(dest_path);
+                let cmp_path = join_force(abs_path, path);
+                trace!("Comparing {:?} to {:?}", &destination.path(), &cmp_path);
+                match destination.path().cmp(&cmp_path) {
                     Ordering::Less => {
+                        trace!("Item is less. Considered existing...");
                         process_existing(destination)?;
                         next_dst = dst_iter.next();
                     }
                     Ordering::Equal => {
                         // process existing node
-                        if (node.is_dir() && !destination.file_type().unwrap().is_dir())
-                            || (node.is_file() && !destination.metadata().unwrap().is_file())
+                        if (node.is_dir() && !destination.metadata().is_dir)
+                            || (node.is_file() && destination.metadata().is_dir)
                             || node.is_special()
                         {
                             // if types do not match, first remove the existing file
+                            trace!("Item is equal and exists. Special item...");
                             process_existing(destination)?;
                         }
+                        trace!("Item is equal and exists. Non-special item...");
                         process_node(path, node, true)?;
                         next_dst = dst_iter.next();
                         next_node = node_streamer.next().transpose()?;
                     }
                     Ordering::Greater => {
+                        trace!("Item is not existing.");
                         process_node(path, node, false)?;
                         next_node = node_streamer.next().transpose()?;
                     }
                 }
             }
             (None, Some((path, node))) => {
+                trace!("Dest item is empty.");
                 process_node(path, node, false)?;
                 next_node = node_streamer.next().transpose()?;
             }
@@ -356,8 +453,8 @@ pub(crate) fn collect_and_prepare<P: ProgressBars, S: IndexedFull>(
 /// * If the restore failed.
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
-    opts: RestoreOptions,
-    dest: &LocalDestination,
+    opts: &RestoreOptions,
+    dest: &Arc<dyn DataLocation>,
 ) -> RusticResult<()> {
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
@@ -400,34 +497,35 @@ fn restore_metadata(
 /// If the metadata could not be set.
 // TODO: Return a result here, introduce errors and get rid of logging.
 pub(crate) fn set_metadata(
-    dest: &LocalDestination,
-    opts: RestoreOptions,
+    dest: &Arc<dyn DataLocation>,
+    opts: &RestoreOptions,
     path: &PathBuf,
     node: &Node,
 ) {
     debug!("setting metadata for {}", path.display());
-    dest.create_special(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
-    match (opts.no_ownership, opts.numeric_id) {
-        (true, _) => {}
-        (false, true) => dest
-            .set_uid_gid(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
-        (false, false) => dest
-            .set_user_group(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
-    }
-    dest.set_permission(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
-    dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|_| {
-            warn!(
-                "restore {}: setting extended attributes failed.",
-                path.display()
-            );
-        });
-    dest.set_times(path, &node.meta)
-        .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
+    // DISABLED 3-1-26 FOR CLOUD STORAGE BACKEND
+    // dest.create_special(path, node)
+    //     .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
+    // match (opts.no_ownership, opts.numeric_id) {
+    //     (true, _) => {}
+    //     (false, true) => dest
+    //         .set_uid_gid(path, &node.meta)
+    //         .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
+    //     (false, false) => dest
+    //         .set_user_group(path, &node.meta)
+    //         .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
+    // }
+    // dest.set_permission(path, node)
+    //     .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
+    // dest.set_extended_attributes(path, &node.meta.extended_attributes)
+    //     .unwrap_or_else(|_| {
+    //         warn!(
+    //             "restore {}: setting extended attributes failed.",
+    //             path.display()
+    //         );
+    //     });
+    // dest.set_times(path, &node.meta)
+    //     .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
 }
 
 /// [`restore_contents`] restores all files contents as described by `file_infos`
@@ -449,12 +547,21 @@ pub(crate) fn set_metadata(
 /// * If the length of a file could not be set.
 /// * If the restore failed.
 #[allow(clippy::too_many_lines)]
-fn restore_contents<P: ProgressBars, S: Open>(
+fn restore_contents<P, S>(
     repo: &Repository<P, S>,
-    dest: &LocalDestination,
+    dest: &Arc<dyn DataLocation>,
     token: JobCancelToken,
     file_infos: RestorePlan,
-) -> RusticJobResult<()> {
+) -> RusticJobResult<()>
+where
+    P: ProgressBars,
+    S: Open,
+{
+    use rayon::prelude::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let dest_path = &file_infos.dest_path;
     let RestorePlan {
         names: filenames,
         file_lengths,
@@ -462,64 +569,10 @@ fn restore_contents<P: ProgressBars, S: Open>(
         restore_size: total_size,
         ..
     } = file_infos;
-    let filenames = &filenames;
-    let be = repo.dbe(); // property ref
 
-    // first create needed empty files, as they are not created later.
-    for (i, size) in file_lengths.iter().enumerate() {
-        if *size == 0 {
-            let path = &filenames[i];
-            dest.set_length(path, *size).map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Failed to set the length of the file `{path}`. Please check the path and try again.",
-                    err,
-                )
-                .attach_context("path", path.display().to_string())
-            })?;
-            token.ensure_check()?;
-        }
-    }
-
-    let sizes = &Mutex::new(file_lengths);
-    let p = repo.pb.progress_bytes("restoring file contents...");
-    p.set_length(total_size);
-    token.ensure_good(&p)?;
-
-    let blobs: Vec<_> = restore_info
-        .into_iter()
-        .map(|((pack, bl), fls)| {
-            let from_file = fls
-                .iter()
-                .find(|fl| fl.matches)
-                .map(|fl| (fl.file_idx, fl.file_start, bl.data_length()));
-
-            let name_dests: Vec<_> = fls
-                .iter()
-                .filter(|fl| !fl.matches)
-                .map(|fl| (bl.clone(), fl.file_idx, fl.file_start))
-                .collect();
-            (pack, bl.offset, bl.length, from_file, name_dests)
-        })
-        // optimize reading from backend by reading many blobs in a row
-        .coalesce(|mut x, mut y| {
-            if x.0 == y.0 // if the pack is identical
-                && x.3.is_none() // and we don't read from a present file
-                && y.1 == x.1 + x.2 // and the blobs are contiguous
-                // and we don't trespass the limit
-                && x.2 + y.2 < constants::LIMIT_PACK_READ
-            {
-                x.2 += y.2;
-                x.4.append(&mut y.4);
-                Ok(x)
-            } else {
-                Err((x, y))
-            }
-        })
-        .collect();
-
+    let filenames = Arc::new(filenames);
+    let be = repo.dbe();
     let threads = constants::MAX_READER_THREADS_NUM;
-
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -532,69 +585,160 @@ fn restore_contents<P: ProgressBars, S: Open>(
             .attach_context("num_threads", threads.to_string())
         })?;
 
-    pool.in_place_scope(|s| {
-        for (pack, offset, length, from_file, name_dests) in blobs {
-            let p = &p;
-            if !name_dests.is_empty() {
-                let token = token.clone();
-                s.spawn(move |s1| {
-                    if token.is_cancelled() {
-                        return; // cancel immediately
-                    }
-                    let read_data = match &from_file {
-                        Some((file_idx, offset_file, length_file)) => {
-                            if token.is_cancelled() { return; }
-                            dest.read_at(&filenames[*file_idx], *offset_file, (*length_file).into())
-                                .unwrap()
-                        }
-                        None => {
-                            if token.is_cancelled() { return; }
-                            be.read_partial(FileType::Pack, &pack, false, offset, length)
-                                .unwrap()
-                        }
-                    };
+    // create empty files first
+    for (i, size) in file_lengths.iter().enumerate() {
+        if *size == 0 {
+            let path = join_force(dest_path, &filenames[i]);
+            dest.set_length(&path, 0).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to set the length of the file `{path}`.",
+                    err,
+                )
+                .attach_context("path", path.display().to_string())
+            })?;
+            token.ensure_check()?;
+        }
+    }
 
-                    for (bl, group) in &name_dests.into_iter().chunk_by(|item| item.0.clone()) {
-                        let size = bl.data_length().into();
-                        let data = if from_file.is_some() {
-                            read_data.clone()
-                        } else {
-                            let start = usize::try_from(bl.offset - offset)
-                                .expect("convert from u32 to usize should not fail!");
-                            let end = usize::try_from(bl.offset + bl.length - offset)
-                                .expect("convert from u32 to usize should not fail!");;
-                            be.read_encrypted_from_partial(
-                                &read_data[start..end],
-                                bl.uncompressed_length,
-                            )
-                                .unwrap()
-                        };
+    let p = repo.pb.progress_bytes("restoring file contents...");
+    p.set_length(total_size);
+    token.ensure_good(&p)?;
 
-                        for (_, file_idx, start) in group {
-                            let data = data.clone();
-                            let token = token.clone();
-                            s1.spawn(move |_| {
-                                if token.is_cancelled() { return; } // cancel before writing
+    type BlobEntry = (
+        u64,
+        PackId,
+        u32,
+        u32,
+        Option<NonZeroU32>,
+        Option<(usize, u64, u32)>,
+    );
 
-                                let path = &filenames[file_idx];
-                                let mut sizes_guard = sizes.lock().unwrap();
-                                let filesize = sizes_guard[file_idx];
-                                if filesize > 0 {
-                                    dest.set_length(path, filesize).unwrap();
-                                    sizes_guard[file_idx] = 0;
-                                }
-                                drop(sizes_guard);
+    let mut per_file: BTreeMap<usize, Vec<BlobEntry>> = BTreeMap::new();
+    for ((pack, bl), fls) in restore_info {
+        let from_file = fls
+            .iter()
+            .find(|fl| fl.matches)
+            .map(|fl| (fl.file_idx, fl.file_start, bl.data_length()));
 
-                                if token.is_cancelled() { return; }
-                                dest.write_at(path, start, &data).unwrap();
-                                p.inc(size);
-                            });
-                        }
-                    }
-                });
+        for fl in fls.iter().filter(|fl| !fl.matches) {
+            per_file.entry(fl.file_idx).or_default().push((
+                fl.file_start,
+                pack.clone(),
+                bl.offset,
+                bl.length,
+                bl.uncompressed_length,
+                from_file,
+            ));
+        }
+    }
+
+    for entries in per_file.values_mut() {
+        entries.sort_unstable_by_key(|e| e.0);
+    }
+
+    let read_blob = |from_file: Option<(usize, u64, u32)>,
+                     pack: &PackId,
+                     blob_offset: u32,
+                     blob_length: u32,
+                     uncompressed_length: Option<NonZeroU32>|
+     -> Bytes {
+        match from_file {
+            Some((src_idx, src_offset, src_len)) => {
+                // TODO: add better error handling!
+                let src_path = join_force(dest_path, &filenames[src_idx]);
+                let mut handle = dest
+                    .get_existing(&src_path)
+                    .unwrap()
+                    .unwrap()
+                    .open_read()
+                    .unwrap();
+                handle.seek(SeekFrom::Start(src_offset)).unwrap();
+                Bytes::from(crate::read_at(&mut handle, src_offset, src_len as usize).unwrap())
+            }
+            None => {
+                let raw = be
+                    .read_partial(FileType::Pack, pack, false, blob_offset, blob_length)
+                    .unwrap();
+                be.read_encrypted_from_partial(&raw, uncompressed_length)
+                    .unwrap()
             }
         }
+    };
+
+    //pool.install(|| {
+    per_file.into_par_iter().for_each(|(file_idx, entries)| {
+        if token.is_cancelled() {
+            return;
+        }
+        let path = join_force(dest_path, &filenames[file_idx]);
+        let d_file = dest.ensure_file(&path).unwrap();
+        if d_file.can_full() {
+            // Random-write mode: write each blob directly at its intended offset
+            let mut handle = d_file.open_full().unwrap();
+            for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
+                entries
+            {
+                if token.is_cancelled() {
+                    return;
+                }
+                let data: Bytes = read_blob(
+                    from_file,
+                    &pack,
+                    blob_offset,
+                    blob_length,
+                    uncompressed_length,
+                );
+                let size = data.len() as u64;
+                trace!(
+                    "Random-writing {} bytes to {:?} at offset {}",
+                    size, path, file_start
+                );
+
+                handle.seek(SeekFrom::Start(file_start)).unwrap();
+                handle.write(&data).unwrap();
+                p.inc(size);
+            }
+            handle.flush().unwrap();
+            handle.close().unwrap();
+        } else {
+            let mut expected_offset: u64 = 0;
+            let mut writer = d_file.open_append(true).unwrap();
+            for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
+                entries
+            {
+                if token.is_cancelled() {
+                    return;
+                }
+                if file_start != expected_offset {
+                    panic!(
+                        "Non-sequential restore detected for {:?}: expected {}, got {}",
+                        path, expected_offset, file_start
+                    );
+                }
+                let data: Bytes = read_blob(
+                    from_file,
+                    &pack,
+                    blob_offset,
+                    blob_length,
+                    uncompressed_length,
+                );
+                let size = data.len() as u64;
+                trace!(
+                    "Writing {} bytes to {:?} (expected_offset={})",
+                    size, path, expected_offset
+                );
+
+                writer.write_all(&data).unwrap();
+                expected_offset += size;
+                p.inc(size);
+            }
+            writer.flush().unwrap();
+            writer.close().unwrap();
+        }
     });
+    //});
+
     token.ensure_good(&p)?;
     p.finish();
     Ok(())
@@ -607,7 +751,7 @@ fn restore_contents<P: ProgressBars, S: Open>(
 /// 2) blob within this pack
 /// 3) the actual files and position of this blob within those
 /// 4) Statistical information
-#[derive(Debug, Default)]
+//#[derive(Debug)]
 pub struct RestorePlan {
     /// The names of the files to restore
     names: Filenames,
@@ -615,12 +759,31 @@ pub struct RestorePlan {
     file_lengths: Vec<u64>,
     /// The restore information
     r: RestoreInfo,
+    /// The path to restore to
+    dest_path: PathBuf,
     /// The total restore size
     pub restore_size: u64,
     /// The total size of matched content, i.e. content with needs no restore.
     pub matched_size: u64,
     /// Statistics about the restore.
     pub stats: RestoreStats,
+    /// The backend to restore to...
+    pub be: Arc<dyn DataLocation>,
+}
+
+impl RestorePlan {
+    pub fn new(be: Arc<dyn DataLocation>, dest_path: impl AsRef<Path>) -> Self {
+        Self {
+            be,
+            dest_path: dest_path.as_ref().to_path_buf(),
+            names: Default::default(),
+            file_lengths: Default::default(),
+            r: Default::default(),
+            restore_size: Default::default(),
+            matched_size: Default::default(),
+            stats: Default::default(),
+        }
+    }
 }
 
 /// `BlobLocation` contains information about a blob within a pack
@@ -645,7 +808,7 @@ impl BlobLocation {
 }
 
 /// [`FileLocation`] contains information about a file within a blob
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FileLocation {
     // TODO: The index of the file within ... ?
     file_idx: usize,
@@ -686,58 +849,41 @@ impl RestorePlan {
     /// * If the file could not be added.
     fn add_file<P, S: IndexedFull>(
         &mut self,
-        dest: &LocalDestination,
+        dest_be: &DataBackends,
+        abs_path: &Path,
         file: &Node,
         name: PathBuf,
         repo: &Repository<P, S>,
         ignore_mtime: bool,
     ) -> RusticResult<AddFileResult> {
-        let mut open_file = dest.get_matching_file(&name, file.meta.size);
+        let dest = dest_be.repository();
+        let path = join_force(abs_path, &name);
+        let open_file = dest
+            .get_matching_file(&path, file.meta.size)
+            .map_err(|err| {
+                RusticError::with_source(ErrorKind::InputOutput, "Failed to get matching file", err)
+            })?;
 
-        // Empty files which exists with correct size should always return Ok(Existing)!
+        // Check empty files first
         if file.meta.size == 0 {
-            if let Some(meta) = open_file
-                .as_ref()
-                .map(std::fs::File::metadata)
-                .transpose()
-                .map_err(|err|
-                    RusticError::with_source(
-                        ErrorKind::InputOutput,
-                        "Failed to get the metadata of the file `{path}`. Please check the path and try again.",
-                        err
-                    )
-                    .attach_context("path", name.display().to_string())
-                )?
-            {
-                if meta.len() == 0 {
-                    // Empty file exists
+            if let Some(meta) = open_file.as_ref().map(|x| x.metadata()) {
+                if meta.size == 0 {
                     return Ok(AddFileResult::Existing);
                 }
             }
         }
 
+        // Check mtime if not ignoring it
         if !ignore_mtime {
-            if let Some(meta) = open_file
-                .as_ref()
-                .map(std::fs::File::metadata)
-                .transpose()
-                .map_err(|err|
-                    RusticError::with_source(
-                        ErrorKind::InputOutput,
-                        "Failed to get the metadata of the file `{path}`. Please check the path and try again.",
-                        err
-                    )
-                    .attach_context("path", name.display().to_string())
-                )?
-            {
-                // TODO: This is the same logic as in backend/ignore.rs => consolidate!
+            if let Some(meta) = open_file.as_ref().map(|x| x.metadata()) {
                 let mtime = meta
-                    .modified()
-                    .ok()
+                    .mtime
                     .map(|t| DateTime::<Utc>::from(t).with_timezone(&Local));
-                if meta.len() == file.meta.size && mtime == file.meta.mtime {
-                    // File exists with fitting mtime => we suspect this file is ok!
-                    debug!("file {} exists with suitable size and mtime, accepting it!",name.display());
+                if meta.size == file.meta.size && mtime == file.meta.mtime {
+                    debug!(
+                        "file {} exists with suitable size and mtime, accepting it!",
+                        name.display()
+                    );
                     self.matched_size += file.meta.size;
                     return Ok(AddFileResult::Existing);
                 }
@@ -748,6 +894,22 @@ impl RestorePlan {
         self.names.push(name);
         let mut file_pos = 0;
         let mut has_unmatched = false;
+
+        // Only open the file once for matching blobs
+        let mut open = if let Some(ref file) = open_file
+            && dest_be.bias() == RestoreBias::PreferDownloads
+        {
+            Some(file.open_read().map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to open file for verification",
+                    err,
+                )
+            })?)
+        } else {
+            None
+        };
+
         for id in file.content.iter().flatten() {
             let ie = repo.get_index_entry(id)?;
             let bl = BlobLocation {
@@ -755,11 +917,14 @@ impl RestorePlan {
                 length: ie.length,
                 uncompressed_length: ie.uncompressed_length,
             };
-            let length: u64 = bl.data_length().into();
 
-            let matches = open_file
-                .as_mut()
-                .is_some_and(|file| id.blob_matches_reader(length, file));
+            let mut matches = false;
+            let length: u64 = bl.data_length().into();
+            if let Some(open) = open.as_mut() {
+                if id.blob_matches_reader(length, open) {
+                    matches = true;
+                }
+            }
 
             let blob_location = self.r.entry((ie.pack, bl)).or_default();
             blob_location.push(FileLocation {
@@ -776,6 +941,20 @@ impl RestorePlan {
             }
 
             file_pos += length;
+        }
+
+        // For backends that don’t support random writes, mark all segments unmatched
+        if has_unmatched && !dest_be.supports_random() {
+            for id in file.content.iter().flatten() {
+                let ie = repo.get_index_entry(id)?;
+                for ((pack_id, _), file_locs) in self.r.iter_mut() {
+                    if *pack_id == ie.pack {
+                        for fl in file_locs.iter_mut() {
+                            fl.matches = false;
+                        }
+                    }
+                }
+            }
         }
 
         self.file_lengths.push(file_pos);

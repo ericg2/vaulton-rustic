@@ -1,5 +1,11 @@
 use crate::SupportedBackend;
+use crate::data_be::SupportedDataBackend;
+use chrono::{DateTime, Local, Utc};
+use opendal::Metadata;
+use opendal::raw::Timestamp;
 use rustic_core::{ErrorKind, RusticError, RusticResult};
+use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 /// A backend location. This is a string that represents the location of the backend.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -24,6 +30,33 @@ impl std::fmt::Display for BackendLocation {
         write!(f, "{}", self.0)?;
         Ok(())
     }
+}
+
+pub fn get_meta(data: &Metadata) -> rustic_core::Metadata {
+    rustic_core::Metadata {
+        mode: None,
+        mtime: data
+            .last_modified()
+            .map(SystemTime::from)
+            .map(DateTime::<Utc>::from)
+            .map(|x| x.with_timezone(&Local)),
+        atime: None,
+        ctime: None,
+        uid: None,
+        gid: None,
+        user: None,
+        group: None,
+        inode: 0,
+        device_id: 0,
+        size: data.content_length(),
+        links: 0,
+        x_attrs: vec![],
+    }
+}
+
+pub fn strip_all<'a>(st: &'a str, p: &'a str) -> &'a str {
+    let x = st.strip_prefix(p).unwrap_or(st);
+    x.strip_suffix(p).unwrap_or(x)
 }
 
 /// Splits the given url into the backend type and the path.
@@ -70,6 +103,55 @@ pub fn location_to_type_and_path(
         )),
         None => Ok((
             SupportedBackend::Local,
+            BackendLocation(raw_location.to_string()),
+        )),
+    }
+}
+
+/// Splits the given url into the backend type and the path.
+///
+/// # Arguments
+///
+/// * `url` - The url to split.
+///
+/// # Errors
+///
+/// * If the url is not a valid url, an error is returned.
+///
+/// # Returns
+///
+/// A tuple with the backend type and the path.
+///
+/// # Notes
+///
+/// If the url is a windows path, the type will be "local".
+pub fn data_location_to_type_and_path(
+    raw_location: &str,
+) -> RusticResult<(SupportedDataBackend, BackendLocation)> {
+    match raw_location.split_once(':') {
+        #[cfg(windows)]
+        Some((drive_letter, _)) if drive_letter.len() == 1 && !raw_location.contains('/') => Ok((
+            SupportedDataBackend::Local,
+            BackendLocation(raw_location.to_string()),
+        )),
+        #[cfg(windows)]
+        Some((scheme, path)) if scheme.contains('\\') || path.contains('\\') => Ok((
+            SupportedDataBackend::Local,
+            BackendLocation(raw_location.to_string()),
+        )),
+        Some((scheme, path)) => Ok((
+            SupportedDataBackend::try_from(scheme).map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::Unsupported,
+                    "The backend type `{name}` is not supported. Please check the given backend and try again.",
+                    err
+                )
+                    .attach_context("name", scheme)
+            })?,
+            BackendLocation(path.to_string()),
+        )),
+        None => Ok((
+            SupportedDataBackend::Local,
             BackendLocation(raw_location.to_string()),
         )),
     }

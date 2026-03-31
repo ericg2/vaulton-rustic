@@ -3,11 +3,11 @@ pub(crate) mod parent;
 pub(crate) mod tree;
 pub(crate) mod tree_archiver;
 
-use std::path::{Path, PathBuf};
-
 use chrono::Local;
 use log::warn;
 use pariter::{IteratorExt, scope};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::cancel::JobCancelToken;
 use crate::error::{RusticJobError, RusticJobResult};
@@ -17,7 +17,7 @@ use crate::{
         file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
         tree_archiver::TreeArchiver,
     },
-    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
+    backend::{DataLister, decrypt::DecryptFullBackend},
     blob::BlobType,
     error::{ErrorKind, RusticError, RusticResult},
     index::{
@@ -125,38 +125,43 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * If sending the message to the raw packer fails.
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
-    pub fn archive<R>(
+    pub fn archive(
         mut self,
-        src: &R,
+        abs_path: &Path,
+        src: Arc<dyn DataLister>,
         backup_path: &Path,
         as_path: Option<&PathBuf>,
         skip_identical_parent: bool,
         no_scan: bool,
         p: &impl Progress,
         token: JobCancelToken,
-    ) -> RusticJobResult<SnapshotFile>
-    where
-        R: ReadSource + 'static,
-        <R as ReadSource>::Open: Send,
-        <R as ReadSource>::Iter: Send,
-    {
+    ) -> RusticJobResult<SnapshotFile> {
+        let src1 = src.clone();
+        let src2 = src.clone();
         std::thread::scope(|s| -> RusticJobResult<_> {
             // determine backup size in parallel to running backup
             token.ensure_good(p)?;
-            let src_size_handle = s.spawn(|| {
+            let src_size_handle = s.spawn(move || {
                 if !no_scan && !p.is_hidden() {
-                    match src.size() {
+                    match src1.size() {
                         Ok(Some(size)) => p.set_length(size),
                         Ok(None) => {}
-                        Err(err) => warn!("error determining backup size: {}", err.display_log()),
+                        Err(err) => warn!("error determining backup size: {}", err),
                     }
                 }
             });
 
             // filter out errors and handle as_path
             token.ensure_good(p)?;
-            let iter = src
-                .entries()
+            let iter = src2
+                .get_iter()
+                .map_err(|x| {
+                    RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Failed to read archive iterator",
+                        x,
+                    )
+                })?
                 .take_while(|_| !token.is_cancelled())
                 .filter_map(|item| {
                     if token.is_cancelled() {
@@ -164,10 +169,16 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     } else {
                         match item {
                             Err(err) => {
-                                warn!("ignoring error: {}", err.display_log());
+                                warn!("ignoring error: {}", err);
                                 None
                             }
-                            Ok(ReadSourceEntry { path, node, open }) => {
+                            Ok(x) => {
+                                let path = x.path();
+                                let node = x.node();
+                                let open = x.handle();
+                                if path == abs_path {
+                                    return None; // *** MAKE SURE IT'S NOT ROOT!
+                                }
                                 let snapshot_path = if let Some(as_path) = as_path {
                                     as_path
                                         .clone()
@@ -175,9 +186,12 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                                 } else {
                                     path
                                 };
+
                                 Some(if node.is_dir() {
+                                    //print!("Found dir {:?} {:?}", &snapshot_path, &node);
                                     (snapshot_path, node, open)
                                 } else {
+                                    //print!("Found file {:?} {:?}", &snapshot_path, &node);
                                     (
                                         snapshot_path
                                             .parent()

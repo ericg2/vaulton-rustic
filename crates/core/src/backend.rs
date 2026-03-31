@@ -1,27 +1,30 @@
 //! Module for backend related functionality.
 pub(crate) mod cache;
-pub(crate) mod childstdout;
+pub(crate) mod data;
 pub(crate) mod decrypt;
 pub(crate) mod dry_run;
+pub(crate) mod filters;
 pub(crate) mod hotcold;
 pub(crate) mod ignore;
-pub(crate) mod local_destination;
 pub(crate) mod node;
-pub(crate) mod stdin;
 pub(crate) mod warm_up;
-
-use std::{io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use enum_map::Enum;
 use log::trace;
+use std::path::Path;
+use std::{io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 #[cfg(test)]
 use mockall::mock;
 
 use serde_derive::{Deserialize, Serialize};
 
-use crate::{
+use crate::commands::restore::RestoreBias;
+use crate::{ErrorKind, PathList, RusticError};
+pub(crate) use crate::{
+    backend::data::{DataFile, DataLocation},
+    backend::filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions},
     backend::node::{Metadata, Node, NodeType},
     error::RusticResult,
     id::Id,
@@ -45,7 +48,7 @@ pub const ALL_FILE_TYPES: [FileType; 4] = [
     FileType::Pack,
 ];
 
-/// Type for describing the kind of a file that can occur.
+/// Type for describing the kind of file that can occur.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Enum, derive_more::Display)]
 pub enum FileType {
     /// Config file
@@ -332,9 +335,11 @@ impl WriteBackend for Arc<dyn WriteBackend> {
     fn create(&self) -> RusticResult<()> {
         self.deref().create()
     }
+
     fn write_bytes(&self, tpe: FileType, id: &Id, cacheable: bool, buf: Bytes) -> RusticResult<()> {
         self.deref().write_bytes(tpe, id, cacheable, buf)
     }
+
     fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
         self.deref().remove(tpe, id, cacheable)
     }
@@ -344,15 +349,19 @@ impl ReadBackend for Arc<dyn WriteBackend> {
     fn location(&self) -> String {
         self.deref().location()
     }
+
     fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
         self.deref().list_with_size(tpe)
     }
+
     fn list(&self, tpe: FileType) -> RusticResult<Vec<Id>> {
         self.deref().list(tpe)
     }
+
     fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
         self.deref().read_full(tpe, id)
     }
+
     fn read_partial(
         &self,
         tpe: FileType,
@@ -372,71 +381,11 @@ impl std::fmt::Debug for dyn WriteBackend {
     }
 }
 
-/// Information about an entry to be able to open it.
-///
-/// # Type Parameters
-///
-/// * `O` - The type of the open information.
-#[derive(Debug, Clone)]
-pub struct ReadSourceEntry<O> {
-    /// The path of the entry.
-    pub path: PathBuf,
-
-    /// The node information of the entry.
-    pub node: Node,
-
-    /// Information about how to open the entry.
-    pub open: Option<O>,
-}
-
-impl<O> ReadSourceEntry<O> {
-    fn from_path(path: PathBuf, open: Option<O>) -> BackendResult<Self> {
-        let node = Node::new_node(
-            path.file_name()
-                .ok_or_else(|| BackendErrorKind::PathNotAllowed(path.clone()))?,
-            NodeType::File,
-            Metadata::default(),
-        );
-        Ok(Self { path, node, open })
-    }
-}
-
-/// Trait for backends that can read and open sources.
-/// This trait is implemented by all backends that can read data and open from a source.
-pub trait ReadSourceOpen {
-    /// The Reader used for this source
-    type Reader: Read + Send + 'static;
-
-    /// Opens the source.
-    ///
-    /// # Errors
-    ///
-    /// * If the source could not be opened.
-    ///
-    /// # Result
-    ///
-    /// The reader used to read from the source.
-    fn open(self) -> RusticResult<Self::Reader>;
-}
-
-/// blanket implementation for readers
-impl<T: Read + Send + 'static> ReadSourceOpen for T {
-    type Reader = T;
-    fn open(self) -> RusticResult<Self::Reader> {
-        Ok(self)
-    }
-}
-
 /// Trait for backends that can read from a source.
 ///
 /// This trait is implemented by all backends that can read data from a source.
-pub trait ReadSource: Sync + Send {
-    /// The type used to handle open source files
-    type Open: ReadSourceOpen;
-    /// The iterator we use to iterate over the source entries
-    type Iter: Iterator<Item = RusticResult<ReadSourceEntry<Self::Open>>>;
-
-    /// Returns the size of the source.
+pub trait DataLister: Sync + Send {
+    /// Returns the size of the source (in bytes).
     ///
     /// # Errors
     ///
@@ -445,11 +394,39 @@ pub trait ReadSource: Sync + Send {
     /// # Returns
     ///
     /// The size of the source, if it is known.
-    fn size(&self) -> RusticResult<Option<u64>>;
+    fn size(&self) -> std::io::Result<Option<u64>>;
 
-    /// Returns an iterator over the entries of the source.
-    fn entries(&self) -> Self::Iter;
+    /// Returns the filtering options of the source
+    ///
+    /// # Returns
+    ///
+    /// The [`DataFilterOptions`] if available.
+    fn options(&self) -> DataFilterOptions;
+
+    /// Returns the iterator of the source
+    ///
+    /// # Returns
+    ///
+    /// The iterator.
+    fn get_iter(self: Arc<Self>) -> std::io::Result<Box<dyn DataIterator>>;
+
+    /// Returns the `[Path]` of the lister root.
+    ///
+    /// # Returns
+    ///
+    /// The path.
+    fn path(&self) -> &Path;
 }
+
+pub trait DataIterator: Send + Sync
+where
+    Self: Iterator<Item = std::io::Result<DataFile>>,
+    Self: Send, // ensures the iterator itself can be sent across threads
+    Self: Sync,
+{
+}
+
+impl<T> DataIterator for T where T: Iterator<Item = std::io::Result<DataFile>> + Send + Sync {}
 
 /// Trait for backends that can write to a source.
 ///
@@ -533,5 +510,46 @@ impl RepositoryBackends {
     #[must_use]
     pub fn repo_hot(&self) -> Option<Arc<dyn WriteBackend>> {
         self.repo_hot.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct DataBackends {
+    data: Arc<dyn DataLocation>,
+    bias: RestoreBias,
+}
+
+impl DataBackends {
+    pub fn new(data: Arc<dyn DataLocation>, bias: RestoreBias) -> Self {
+        Self { data, bias }
+    }
+
+    #[must_use]
+    pub fn repository(&self) -> Arc<dyn DataLocation> {
+        self.data.clone()
+    }
+
+    pub fn bias(&self) -> RestoreBias {
+        self.bias
+    }
+
+    pub(crate) fn prepare_backup(
+        &self,
+        path: impl AsRef<Path>,
+        opts: DataFilterOptions,
+    ) -> RusticResult<Arc<dyn DataLister>> {
+        self.data
+            .read_dir_filtered(path.as_ref(), Some(opts), true)
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::Backend,
+                    "Failed to prepare backup. Please check all file paths.",
+                    err,
+                )
+            })
+    }
+
+    pub fn supports_random(&self) -> bool {
+        self.data.supports_random()
     }
 }

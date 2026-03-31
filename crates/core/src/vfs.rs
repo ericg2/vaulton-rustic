@@ -1,23 +1,13 @@
 mod format;
 
-use std::{
-    collections::BTreeMap,
-    ffi::{OsStr, OsString},
-    path::{Component, Path, PathBuf},
-};
-
 use bytes::{Bytes, BytesMut};
 use runtime_format::FormatArgs;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+use std::{collections::BTreeMap, ffi::{OsStr, OsString}, io, path::{Component, Path, PathBuf}};
 use strum::EnumString;
 
-use crate::{
-    blob::{BlobId, DataId, tree::TreeId},
-    error::{ErrorKind, RusticError, RusticResult},
-    index::ReadIndex,
-    repofile::{BlobType, Metadata, Node, NodeType, SnapshotFile},
-    repository::{IndexedFull, IndexedTree, Repository},
-    vfs::format::FormattedSnapshot,
-};
+use crate::{DataRead, RepoIndexed, blob::{BlobId, DataId, tree::TreeId}, error::{ErrorKind, RusticError, RusticResult}, index::ReadIndex, repofile::{BlobType, Metadata, Node, NodeType, SnapshotFile}, repository::{IndexedFull, IndexedTree, Repository}, vfs::format::FormattedSnapshot, DataLocation};
 
 /// [`VfsErrorKind`] describes the errors that can be returned from the Virtual File System
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
@@ -454,92 +444,107 @@ impl Vfs {
 /// `OpenFile` stores all information needed to access the contents of a file node
 #[derive(Debug)]
 pub struct OpenFile {
-    // The list of blobs
+    repo: Arc<RepoIndexed>,
     content: Vec<DataId>,
     startpoints: ContentStartpoints,
+    cursor: usize, // current read position
 }
 
 impl OpenFile {
-    /// Create an `OpenFile` from a file `Node`
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - The repository to create the `OpenFile` for
-    /// * `node` - The `Node` to create the `OpenFile` for
-    ///
-    /// # Errors
-    /// - If the index for the needed data blobs cannot be read
-    ///
-    /// # Returns
-    ///
-    /// The created `OpenFile`
-    pub(crate) fn from_node<P, S: IndexedFull>(
-        repo: &Repository<P, S>,
-        node: &Node,
-    ) -> RusticResult<Self> {
+    pub(crate) fn from_node(repo: Arc<RepoIndexed>, node: &Node) -> RusticResult<Self> {
         let content: Vec<_> = node.content.clone().unwrap_or_default();
-
         let startpoints = ContentStartpoints::from_sizes(content.iter().map(|id| {
             Ok(repo
                 .index()
                 .get_data(id)
                 .ok_or_else(|| {
-                    RusticError::new(ErrorKind::Vfs, "blob {blob} is not contained in index")
+                    RusticError::new(ErrorKind::Other, "blob {blob} not in index")
                         .attach_context("blob", id.to_string())
                 })?
                 .data_length() as usize)
         }))?;
 
         Ok(Self {
+            repo,
             content,
             startpoints,
+            cursor: 0,
         })
     }
 
-    /// Read the `OpenFile` at the given `offset` from the `repo`.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - The repository to read the `OpenFile` from
-    /// * `offset` - The offset to read the `OpenFile` from
-    /// * `length` - The length of the content to read from the `OpenFile`
-    ///
-    /// # Errors
-    ///
-    /// - if reading the needed blob(s) from the backend fails
-    ///
-    /// # Returns
-    ///
-    /// The read bytes from the given offset and length.
-    /// If offset is behind the end of the file, an empty `Bytes` is returned.
-    /// If length is too large, the result up to the end of the file is returned.
-    pub fn read_at<P, S: IndexedFull>(
-        &self,
-        repo: &Repository<P, S>,
-        offset: usize,
-        mut length: usize,
-    ) -> RusticResult<Bytes> {
-        let (mut i, mut offset) = self.startpoints.compute_start(offset);
+    /// Compute which blob and offset correspond to a file offset
+    fn compute_blob_offset(&self, mut offset: usize) -> Option<(usize, usize)> {
+        if self.startpoints.0.is_empty() {
+            return None;
+        }
+        let i = self
+            .startpoints
+            .0
+            .partition_point(|o| o <= &offset)
+            .saturating_sub(1);
+        offset -= self.startpoints.0[i];
+        Some((i, offset))
+    }
+}
 
-        let mut result = BytesMut::with_capacity(length);
+impl DataRead for OpenFile {
+    // fn path(&self) -> PathBuf {
+    //     todo!()
+    // }
+}
 
-        // The case of empty node.content is also correctly handled here
-        while length > 0 && i < self.content.len() {
-            let data = repo.get_blob_cached(&BlobId::from(self.content[i]), BlobType::Data)?;
+impl Read for OpenFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut remaining = buf.len();
+        let mut total_read = 0;
+        let mut local_buf = buf;
 
-            if offset > data.len() {
-                // we cannot read behind the blob. This only happens if offset is too large to fit in the last blob
+        while remaining > 0 {
+            let (i, offset) = match self.compute_blob_offset(self.cursor) {
+                Some(x) => x,
+                None => break, // no content
+            };
+            if i >= self.content.len() {
+                break; // end of file
+            }
+
+            let data = self
+                .repo
+                .get_blob_cached(&BlobId::from(self.content[i]), BlobType::Data)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+            if offset >= data.len() {
                 break;
             }
 
-            let to_copy = (data.len() - offset).min(length);
-            result.extend_from_slice(&data[offset..offset + to_copy]);
-            offset = 0;
-            length -= to_copy;
-            i += 1;
+            let to_copy = (data.len() - offset).min(remaining);
+            local_buf[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
+
+            remaining -= to_copy;
+            total_read += to_copy;
+            self.cursor += to_copy;
+            local_buf = &mut local_buf[to_copy..];
         }
 
-        Ok(result.into())
+        Ok(total_read)
+    }
+}
+
+impl Seek for OpenFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(off) => off as i64,
+            SeekFrom::Current(off) => self.cursor as i64 + off,
+            SeekFrom::End(off) => {
+                let len = self.startpoints.0.last().cloned().unwrap_or(0);
+                len as i64 + off
+            }
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"));
+        }
+        self.cursor = new_pos as usize;
+        Ok(self.cursor as u64)
     }
 }
 

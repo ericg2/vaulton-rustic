@@ -1,6 +1,11 @@
 pub(crate) mod command_input;
 pub(crate) mod warm_up;
 
+use bytes::Bytes;
+use derive_setters::Setters;
+use log::{debug, error, info};
+use serde_with::{DisplayFromStr, serde_as};
+use std::fmt::Debug;
 use std::{
     cmp::Ordering,
     fs::File,
@@ -10,19 +15,14 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
-use derive_setters::Setters;
-use log::{debug, error, info};
-use serde_with::{DisplayFromStr, serde_as};
-
 use crate::{
-    RepositoryBackends, RusticError,
+    DataBackends, DataFilterOptions, DataLister, RepoFilterOptions, RepositoryBackends,
+    RusticError,
     backend::{
         FileType, FindInBackend, ReadBackend, WriteBackend,
         cache::{Cache, CachedBackend},
         decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
         hotcold::HotColdBackend,
-        local_destination::LocalDestination,
         node::Node,
         warm_up::WarmUpAccessBackend,
     },
@@ -67,10 +67,11 @@ use crate::{
     vfs::OpenFile,
 };
 
-#[cfg(feature = "clap")]
-use clap::ValueHint;
+use crate::backend::data::DataLocation;
 use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
+#[cfg(feature = "clap")]
+use clap::ValueHint;
 
 mod constants {
     /// Estimated item capacity used for cache in [`FullIndex`](super::FullIndex)
@@ -1220,7 +1221,11 @@ impl<P: ProgressBars, S: Open> Repository<P, S> {
     /// # Panics
     ///
     // TODO: Document panics
-    pub fn check(&self, opts: CheckOptions, token: JobCancelToken) -> RusticJobResult<CheckResults> {
+    pub fn check(
+        &self,
+        opts: CheckOptions,
+        token: JobCancelToken,
+    ) -> RusticJobResult<CheckResults> {
         let trees = self
             .get_all_snapshots()?
             .into_iter()
@@ -1570,6 +1575,11 @@ pub trait IndexedFull: IndexedIds {
     ) -> RusticResult<Bytes>;
 }
 
+/// A node iterator based on the respective values.
+pub trait NodeIterator: Iterator<Item = RusticResult<(PathBuf, Node)>> + Send + Sync {}
+
+impl<T> NodeIterator for T where T: Iterator<Item = RusticResult<(PathBuf, Node)>> + Send + Sync {}
+
 /// The indexed status of a repository
 ///
 /// # Type Parameters
@@ -1678,6 +1688,22 @@ impl<T, S: Open> Open for IndexedStatus<T, S> {
     }
 }
 
+pub type RepoIndexed = Repository<NoProgressBars, IndexedStatus<FullIndex, OpenStatus>>;
+
+impl RepoIndexed {
+    /// Open a file in the repository for reading
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - The node to open
+    ///
+    /// # Errors
+    /// If the file couldn't be opened.
+    pub fn open_file(self: Arc<Self>, node: &Node) -> RusticResult<OpenFile> {
+        OpenFile::from_node(self, node)
+    }
+}
+
 impl<P, S: IndexedFull> Repository<P, S> {
     /// Get the [`IndexEntry`] of the given blob
     ///
@@ -1701,45 +1727,6 @@ impl<P, S: IndexedFull> Repository<P, S> {
         })?;
 
         Ok(ie)
-    }
-
-    /// Open a file in the repository for reading
-    ///
-    /// # Arguments
-    ///
-    /// * `node` - The node to open
-    ///
-    /// # Errors
-    ///
-    // TODO: Document errors
-    pub fn open_file(&self, node: &Node) -> RusticResult<OpenFile> {
-        OpenFile::from_node(self, node)
-    }
-
-    /// Reads an opened file at the given position
-    ///
-    /// # Arguments
-    ///
-    /// * `open_file` - The opened file
-    /// * `offset` - The offset to start reading
-    /// * `length` - The length to read
-    ///
-    /// # Returns
-    ///
-    /// The read bytes from the given offset and length.
-    /// If offset is behind the end of the file, an empty `Bytes` is returned.
-    /// If length is too large, the result up to the end of the file is returned.
-    ///
-    /// # Errors
-    ///
-    // TODO: Document errors
-    pub fn read_file_at(
-        &self,
-        open_file: &OpenFile,
-        offset: usize,
-        length: usize,
-    ) -> RusticResult<Bytes> {
-        open_file.read_at(self, offset, length)
     }
 }
 
@@ -1920,7 +1907,7 @@ impl<P: ProgressBars, S: IndexedTree> Repository<P, S> {
         &self,
         node: &Node,
         ls_opts: &LsOptions,
-    ) -> RusticResult<impl Iterator<Item = RusticResult<(PathBuf, Node)>> + Clone + '_> {
+    ) -> RusticResult<impl NodeIterator + Clone + '_> {
         NodeStreamer::new_with_glob(self.dbe().clone(), self.index(), node, ls_opts)
     }
 
@@ -1941,10 +1928,9 @@ impl<P: ProgressBars, S: IndexedTree> Repository<P, S> {
         restore_infos: RestorePlan,
         opts: &RestoreOptions,
         node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
-        dest: &LocalDestination,
         token: JobCancelToken,
     ) -> RusticJobResult<()> {
-        restore_repository(restore_infos, self, *opts, token, node_streamer, dest)
+        restore_repository(restore_infos, self, opts, token, node_streamer)
     }
 
     /// Merge the given trees.
@@ -2023,12 +2009,21 @@ impl<P: ProgressBars, S: IndexedIds> Repository<P, S> {
     /// The saved snapshot.
     pub fn backup(
         &self,
+        src: &DataBackends,
+        src_path: impl AsRef<Path>,
+        src_opts: &DataFilterOptions,
         opts: &BackupOptions,
-        source: &PathList,
         snap: SnapshotFile,
         token: JobCancelToken,
     ) -> RusticJobResult<SnapshotFile> {
-        commands::backup::backup(self, opts, source, token, snap)
+        commands::backup::backup(
+            src,
+            src.prepare_backup(src_path, src_opts.clone())?,
+            self,
+            opts,
+            token,
+            snap,
+        )
     }
 }
 
@@ -2125,12 +2120,20 @@ impl<P: ProgressBars, S: IndexedFull> Repository<P, S> {
     pub fn prepare_restore(
         &self,
         opts: &RestoreOptions,
-        node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
-        dest: &LocalDestination,
-        dry_run: bool,
+        node_streamer: impl NodeIterator,
+        dest: &DataBackends,
+        dest_path: impl AsRef<Path>,
         token: JobCancelToken,
     ) -> RusticJobResult<RestorePlan> {
-        collect_and_prepare(self, *opts, node_streamer, dest, dry_run, token)
+        collect_and_prepare(
+            self,
+            opts,
+            node_streamer,
+            dest,
+            dest_path.as_ref(),
+            opts.dry_run,
+            token,
+        )
     }
 
     /// Copy the given `snapshots` to `repo_dest`.

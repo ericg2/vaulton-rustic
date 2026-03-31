@@ -292,7 +292,7 @@ impl ReadBackend for RestBackend {
                 .attach_context("tpe", tpe.to_string())
                 .attach_context("tpe_dir", tpe.dirname().to_string())
         })?;
-
+        
         self.retry_notify(|| {
             if tpe == FileType::Config {
                 return Ok(

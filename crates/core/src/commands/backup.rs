@@ -3,33 +3,22 @@ use derive_setters::Setters;
 use log::info;
 
 use std::path::PathBuf;
-
+use std::sync::Arc;
 use path_dedot::ParseDot;
 use serde_derive::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
-use crate::{
-    CommandInput,
-    archiver::{Archiver, parent::Parent},
-    backend::{
-        childstdout::ChildStdoutSource,
-        dry_run::DryRunBackend,
-        ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
-        stdin::StdinSource,
-    },
-    error::{ErrorKind, RusticError, RusticResult},
-    progress::ProgressBars,
-    repofile::{
-        PathList, SnapshotFile,
-        snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
-    },
-    repository::{IndexedIds, IndexedTree, Repository},
-};
+use crate::{CommandInput, DataLister, archiver::{Archiver, parent::Parent}, backend::{
+    dry_run::DryRunBackend,
+}, error::{ErrorKind, RusticError, RusticResult}, progress::ProgressBars, repofile::{
+    PathList, SnapshotFile,
+    snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
+}, repository::{IndexedIds, IndexedTree, Repository}, DataBackends, join_force};
 
-#[cfg(feature = "clap")]
-use clap::ValueHint;
 use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
+#[cfg(feature = "clap")]
+use clap::ValueHint;
 
 /// `backup` subcommand
 #[serde_as]
@@ -138,19 +127,6 @@ impl ParentOptions {
 #[non_exhaustive]
 /// Options for the `backup` command.
 pub struct BackupOptions {
-    /// Set filename to be used when backing up from stdin
-    #[cfg_attr(
-        feature = "clap",
-        clap(long, value_name = "FILENAME", default_value = "stdin", value_hint = ValueHint::FilePath)
-    )]
-    #[cfg_attr(feature = "merge", merge(skip))]
-    pub stdin_filename: String,
-
-    /// Call the given command and use its output as stdin
-    #[cfg_attr(feature = "clap", clap(long, value_name = "COMMAND"))]
-    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
-    pub stdin_command: Option<CommandInput>,
-
     /// Manually set backup path in snapshot
     #[cfg_attr(feature = "clap", clap(long, value_name = "PATH", value_hint = ValueHint::DirPath))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
@@ -170,16 +146,6 @@ pub struct BackupOptions {
     #[serde(flatten)]
     /// Options how to use a parent snapshot
     pub parent_opts: ParentOptions,
-
-    #[cfg_attr(feature = "clap", clap(flatten))]
-    #[serde(flatten)]
-    /// Options how to save entries from a local source
-    pub ignore_save_opts: LocalSourceSaveOptions,
-
-    #[cfg_attr(feature = "clap", clap(flatten))]
-    #[serde(flatten)]
-    /// Options how to filter from a local source
-    pub ignore_filter_opts: LocalSourceFilterOptions,
 }
 
 /// Backup data, create a snapshot.
@@ -208,22 +174,20 @@ pub struct BackupOptions {
 ///
 /// The snapshot pointing to the backup'ed data.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn backup<P: ProgressBars, S: IndexedIds>(
+pub(crate) fn backup<P, S>(
+    data_be: &DataBackends,
+    src: Arc<dyn DataLister>,
     repo: &Repository<P, S>,
     opts: &BackupOptions,
-    source: &PathList,
     token: JobCancelToken,
     mut snap: SnapshotFile,
-) -> RusticJobResult<SnapshotFile> {
+) -> RusticJobResult<SnapshotFile>
+where
+    P: ProgressBars,
+    S: IndexedIds,
+{
+    let backup_path = src.path().to_path_buf();
     let index = repo.index();
-
-    let backup_stdin = *source == PathList::from_string("-")?;
-    let backup_path = if backup_stdin {
-        vec![PathBuf::from(&opts.stdin_filename)]
-    } else {
-        source.paths()
-    };
-
     let as_path = opts
         .as_path
         .as_ref()
@@ -253,7 +217,7 @@ pub(crate) fn backup<P: ProgressBars, S: IndexedIds>(
                 )
                 .attach_context("paths", p.display().to_string())
             })?,
-        None => snap.paths.set_paths(&backup_path).map_err(|err| {
+        None => snap.paths.set_paths(&[&backup_path]).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Internal,
                 "Failed to set paths `{paths}` in snapshot.",
@@ -270,7 +234,7 @@ pub(crate) fn backup<P: ProgressBars, S: IndexedIds>(
         })?,
     }
 
-    let (parent_id, parent) = opts.parent_opts.get_parent(repo, &snap, backup_stdin);
+    let (parent_id, parent) = opts.parent_opts.get_parent(repo, &snap, false);
     match parent_id {
         Some(id) => {
             info!("using parent {id}");
@@ -283,54 +247,20 @@ pub(crate) fn backup<P: ProgressBars, S: IndexedIds>(
 
     token.ensure_check()?;
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
-    info!("starting to backup {source} ...");
+    info!("starting to backup ...");
     let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
     let p = repo.pb.progress_bytes("backing up...");
     token.ensure_good(&p)?;
-
-    let snap = if backup_stdin {
-        let path = &backup_path[0];
-        if let Some(command) = &opts.stdin_command {
-            let src = ChildStdoutSource::new(command, path.clone())?;
-            let res = archiver.archive(
-                &src,
-                path,
-                as_path.as_ref(),
-                opts.parent_opts.skip_if_unchanged,
-                opts.no_scan,
-                &p,
-                token.clone(),
-            )?;
-            src.finish()?;
-            res
-        } else {
-            let src = StdinSource::new(path.clone());
-            archiver.archive(
-                &src,
-                path,
-                as_path.as_ref(),
-                opts.parent_opts.skip_if_unchanged,
-                opts.no_scan,
-                &p,
-                token.clone()
-            )?
-        }
-    } else {
-        let src = LocalSource::new(
-            opts.ignore_save_opts,
-            &opts.ignore_filter_opts,
-            &backup_path,
-        )?;
-        archiver.archive(
-            &src,
-            &backup_path[0],
-            as_path.as_ref(),
-            opts.parent_opts.skip_if_unchanged,
-            opts.no_scan,
-            &p,
-            token.clone()
-        )?
-    };
+    let snap = archiver.archive(
+        &backup_path, // TODO: needs big checking!!!
+        src,
+        &backup_path,
+        as_path.as_ref(),
+        opts.parent_opts.skip_if_unchanged,
+        opts.no_scan,
+        &p,
+        token.clone(),
+    )?;
 
     Ok(snap)
 }

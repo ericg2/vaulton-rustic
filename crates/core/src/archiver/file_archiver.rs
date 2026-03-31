@@ -1,27 +1,16 @@
+use crate::{archiver::{
+    parent::{ItemWithParent, ParentResult},
+    tree::TreeType,
+    tree_archiver::TreeItem,
+}, backend::{
+    decrypt::DecryptWriteBackend,
+    node::{Node, NodeType},
+}, blob::{
+    packer::{Packer, PackerStats}, BlobId, BlobType,
+    DataId,
+}, chunker::ChunkIter, crypto::hasher::hash, error::{ErrorKind, RusticError, RusticResult}, index::{indexer::SharedIndexer, ReadGlobalIndex}, progress::Progress, repofile::configfile::ConfigFile, FileOpHandle};
 use std::io::Read;
-
-use crate::{
-    archiver::{
-        parent::{ItemWithParent, ParentResult},
-        tree::TreeType,
-        tree_archiver::TreeItem,
-    },
-    backend::{
-        ReadSourceOpen,
-        decrypt::DecryptWriteBackend,
-        node::{Node, NodeType},
-    },
-    blob::{
-        BlobId, BlobType, DataId,
-        packer::{Packer, PackerStats},
-    },
-    chunker::ChunkIter,
-    crypto::hasher::hash,
-    error::{ErrorKind, RusticError, RusticResult},
-    index::{ReadGlobalIndex, indexer::SharedIndexer},
-    progress::Progress,
-    repofile::configfile::ConfigFile,
-};
+use std::sync::Arc;
 
 /// The `FileArchiver` is responsible for archiving files.
 /// It will read the file, chunk it, and write the chunks to the backend.
@@ -95,9 +84,9 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// # Returns
     ///
     /// The processed item.
-    pub(crate) fn process<O: ReadSourceOpen>(
+    pub(crate) fn process(
         &self,
-        item: ItemWithParent<Option<O>>,
+        item: ItemWithParent<Arc<dyn FileOpHandle>>,
         p: &impl Progress,
     ) -> RusticResult<TreeItem> {
         Ok(match item {
@@ -110,23 +99,22 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                     (node, size)
                 } else if node.node_type == NodeType::File {
                     let r = open
-                        .ok_or_else(
-                            || RusticError::new(
-                                ErrorKind::Internal,
-                                "Failed to unpack tree type optional at `{path}`. Option should contain a value, but contained `None`.",
-                            )
-                            .attach_context("path", path.display().to_string())
-                            .ask_report(),
-                        )?
-                        .open()
+                        // .ok_or_else(
+                        //     || RusticError::new(
+                        //         ErrorKind::Internal,
+                        //         "Failed to unpack tree type optional at `{path}`. Option should contain a value, but contained `None`.",
+                        //     )
+                        //     .attach_context("path", path.display().to_string())
+                        //     .ask_report(),
+                        // )?
+                        .open_read()
                         .map_err(|err| {
-                            err
-                            .overwrite_kind(ErrorKind::InputOutput)
-                            .prepend_guidance_line("Failed to open ReadSourceOpen at `{path}`")
-                            .attach_context("path", path.display().to_string())
+                            RusticError::with_source(ErrorKind::InputOutput, "Failed to open ReadSourceOpen at `{path}`", err)
+                                .attach_context("path", path.display().to_string())
                         })?;
 
                     self.backup_reader(r, node, p).map_err(|err| {
+                        println!("Error: {err}");
                         err.prepend_guidance_line("Error while backing up `{path}`")
                             .attach_context("path", path.display().to_string())
                     })?
