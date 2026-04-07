@@ -8,7 +8,7 @@ use path_dedot::ParseDot;
 use serde_derive::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
-use crate::{CommandInput, DataLister, archiver::{Archiver, parent::Parent}, backend::{
+use crate::{CommandInput, archiver::{Archiver, parent::Parent}, backend::{
     dry_run::DryRunBackend,
 }, error::{ErrorKind, RusticError, RusticResult}, progress::ProgressBars, repofile::{
     PathList, SnapshotFile,
@@ -19,6 +19,7 @@ use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
 #[cfg(feature = "clap")]
 use clap::ValueHint;
+use crate::backend::BackupQuery;
 
 /// `backup` subcommand
 #[serde_as]
@@ -176,7 +177,7 @@ pub struct BackupOptions {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn backup<P, S>(
     data_be: &DataBackends,
-    src: Arc<dyn DataLister>,
+    src: BackupQuery,
     repo: &Repository<P, S>,
     opts: &BackupOptions,
     token: JobCancelToken,
@@ -186,7 +187,7 @@ where
     P: ProgressBars,
     S: IndexedIds,
 {
-    let backup_path = src.path().to_path_buf();
+    let backup_path = src.clone().path;
     let index = repo.index();
     let as_path = opts
         .as_path

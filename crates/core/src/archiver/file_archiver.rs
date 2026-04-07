@@ -1,14 +1,25 @@
-use crate::{archiver::{
-    parent::{ItemWithParent, ParentResult},
-    tree::TreeType,
-    tree_archiver::TreeItem,
-}, backend::{
-    decrypt::DecryptWriteBackend,
-    node::{Node, NodeType},
-}, blob::{
-    packer::{Packer, PackerStats}, BlobId, BlobType,
-    DataId,
-}, chunker::ChunkIter, crypto::hasher::hash, error::{ErrorKind, RusticError, RusticResult}, index::{indexer::SharedIndexer, ReadGlobalIndex}, progress::Progress, repofile::configfile::ConfigFile, FileOpHandle};
+use crate::backend::DataFile;
+use crate::{
+    archiver::{
+        parent::{ItemWithParent, ParentResult},
+        tree::TreeType,
+        tree_archiver::TreeItem,
+    },
+    backend::{
+        decrypt::DecryptWriteBackend,
+        node::{Node, NodeType},
+    },
+    blob::{
+        BlobId, BlobType, DataId,
+        packer::{Packer, PackerStats},
+    },
+    chunker::ChunkIter,
+    crypto::hasher::hash,
+    error::{ErrorKind, RusticError, RusticResult},
+    index::{ReadGlobalIndex, indexer::SharedIndexer},
+    progress::Progress,
+    repofile::configfile::ConfigFile,
+};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -86,7 +97,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// The processed item.
     pub(crate) fn process(
         &self,
-        item: ItemWithParent<Arc<dyn FileOpHandle>>,
+        item: ItemWithParent<DataFile>,
         p: &impl Progress,
     ) -> RusticResult<TreeItem> {
         Ok(match item {
@@ -99,18 +110,20 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                     (node, size)
                 } else if node.node_type == NodeType::File {
                     let r = open
-                        // .ok_or_else(
-                        //     || RusticError::new(
-                        //         ErrorKind::Internal,
-                        //         "Failed to unpack tree type optional at `{path}`. Option should contain a value, but contained `None`.",
-                        //     )
-                        //     .attach_context("path", path.display().to_string())
-                        //     .ask_report(),
-                        // )?
-                        .open_read()
+                        .be
+                        .reader()
+                        .ok_or(RusticError::new(
+                            ErrorKind::Backend,
+                            "Reading is not supported",
+                        ))?
+                        .open_read_start(&open.path)
                         .map_err(|err| {
-                            RusticError::with_source(ErrorKind::InputOutput, "Failed to open ReadSourceOpen at `{path}`", err)
-                                .attach_context("path", path.display().to_string())
+                            RusticError::with_source(
+                                ErrorKind::InputOutput,
+                                "Failed to open ReadSourceOpen at `{path}`",
+                                err,
+                            )
+                            .attach_context("path", path.display().to_string())
                         })?;
 
                     self.backup_reader(r, node, p).map_err(|err| {

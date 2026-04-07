@@ -1,13 +1,25 @@
 mod format;
 
-use bytes::{Bytes, BytesMut};
 use runtime_format::FormatArgs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
-use std::{collections::BTreeMap, ffi::{OsStr, OsString}, io, path::{Component, Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    io,
+    path::{Component, Path, PathBuf},
+};
 use strum::EnumString;
-
-use crate::{DataRead, RepoIndexed, blob::{BlobId, DataId, tree::TreeId}, error::{ErrorKind, RusticError, RusticResult}, index::ReadIndex, repofile::{BlobType, Metadata, Node, NodeType, SnapshotFile}, repository::{IndexedFull, IndexedTree, Repository}, vfs::format::FormattedSnapshot, DataLocation};
+use tokio::io::AsyncRead;
+use crate::{
+    blob::{tree::TreeId, BlobId, DataId},
+    error::{ErrorKind, RusticError, RusticResult},
+    index::ReadIndex,
+    repofile::{BlobType, Metadata, Node, NodeType, SnapshotFile},
+    repository::{IndexedFull, IndexedTree, Repository},
+    vfs::format::FormattedSnapshot,
+    RepoIndexed,
+};
 
 /// [`VfsErrorKind`] describes the errors that can be returned from the Virtual File System
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
@@ -485,12 +497,6 @@ impl OpenFile {
         offset -= self.startpoints.0[i];
         Some((i, offset))
     }
-}
-
-impl DataRead for OpenFile {
-    // fn path(&self) -> PathBuf {
-    //     todo!()
-    // }
 }
 
 impl Read for OpenFile {

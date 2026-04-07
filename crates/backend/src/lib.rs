@@ -57,25 +57,9 @@ This crate exposes a few features for controlling dependency usage:
 
 pub mod repo_be;
 pub mod data_be;
-/// Local backend for Rustic.
-pub mod local;
-/// Utility functions for the backend.
 pub mod util;
 
-/// `OpenDAL` backend for Rustic.
-#[cfg(feature = "opendal")]
-pub mod opendal;
 
-/// `Rclone` backend for Rustic.
-#[cfg(feature = "rclone")]
-pub mod rclone;
-
-pub mod filters;
-pub mod repo;
-/// REST backend for Rustic.
-#[cfg(feature = "rest")]
-pub mod rest;
-pub mod services;
 pub mod arbhx;
 
 #[cfg(feature = "rclone")]
@@ -84,12 +68,10 @@ pub use crate::rclone::RcloneBackend;
 #[cfg(feature = "rest")]
 pub use crate::rest::RestBackend;
 
-pub use crate::repo::RepoVfsBackend;
+pub use crate::arbhx::ArbhxBackend;
 
 // rustic_backend Public API
-pub use crate::repo_be::{BackendOptions, SupportedBackend};
-
-pub use crate::services::{PointSource};
+pub use crate::repo_be::{BackendOptions};
 
 // re-export for error handling
 pub use rustic_core::{ErrorKind, RusticError, RusticResult, Severity, Status};

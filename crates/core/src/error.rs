@@ -50,11 +50,7 @@
 
 use derive_more::derive::Display;
 use ecow::{EcoString, EcoVec};
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    convert::Into,
-    fmt::{self, Display},
-};
+use std::{backtrace::{Backtrace, BacktraceStatus}, convert::Into, fmt::{self, Display}, io};
 
 pub(crate) mod constants {
     pub const DEFAULT_DOCS_URL: &str = "https://rustic.cli.rs/docs/errors/";
@@ -433,6 +429,30 @@ impl RusticError {
         }
 
         fmt
+    }
+}
+
+impl From<Box<RusticError>> for io::Error {
+    fn from(value: Box<RusticError>) -> io::Error {
+        let kind = match value.kind {
+            ErrorKind::AppendOnly => io::ErrorKind::Unsupported,
+            ErrorKind::Backend => io::ErrorKind::Other,
+            ErrorKind::Configuration => io::ErrorKind::InvalidInput,
+            ErrorKind::Cryptography => io::ErrorKind::InvalidData,
+            ErrorKind::ExternalCommand => io::ErrorKind::Other,
+            ErrorKind::Internal => io::ErrorKind::Other,
+            ErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
+            ErrorKind::InputOutput => io::ErrorKind::Other,
+            ErrorKind::Key => io::ErrorKind::PermissionDenied,
+            ErrorKind::MissingInput => io::ErrorKind::UnexpectedEof,
+            ErrorKind::Other => io::ErrorKind::Other,
+            ErrorKind::Password => io::ErrorKind::PermissionDenied,
+            ErrorKind::Repository => io::ErrorKind::Other,
+            ErrorKind::Unsupported => io::ErrorKind::Unsupported,
+            ErrorKind::Verification => io::ErrorKind::InvalidData,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, value)
     }
 }
 

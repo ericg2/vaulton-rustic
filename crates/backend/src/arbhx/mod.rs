@@ -1,1 +1,3 @@
-pub mod backend;
+mod backend;
+
+pub use backend::ArbhxBackend;

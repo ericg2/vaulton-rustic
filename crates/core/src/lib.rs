@@ -120,6 +120,7 @@ pub(crate) mod repository;
 /// Virtual File System support - allows to act on the repository like on a file system
 pub mod vfs;
 pub(crate) mod cancel;
+pub(crate) mod arbhx;
 
 use std::io;
 use std::io::{Read, Seek, SeekFrom};
@@ -127,21 +128,21 @@ use std::path::{Component, Path, PathBuf};
 // rustic_core Public API
 pub use crate::{
     backend::{
-        ALL_FILE_TYPES, FileType, ReadBackend, DataLister, DataIterator,
-        RepositoryBackends, WriteBackend, DataBackends,
-        decrypt::{compression_level_range, max_compression_level},
-        filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions},
-        node::{ExtMetadata, Metadata, Node, NodeType},
-        node::last_modified_node,
-        data::{DataLocation, VfsReader, DataReadWrite, FileOpHandle, SeqWrite, DataRead, VfsWriter, DataFile, UsageStat},
+        decrypt::{compression_level_range, max_compression_level}, filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions}, node::last_modified_node,
+        node::{ExtMetadata, Metadata, Node, NodeType}, DataBackends, FileType,
+        ReadBackend,
+        RepositoryBackends,
+        WriteBackend,
+        ALL_FILE_TYPES,
     },
     blob::{
-        BlobId, DataId, PackedId,
-        tree::{FindMatches, FindNode, TreeId, TreeStreamerOptions as LsOptions},
+        tree::{FindMatches, FindNode, TreeId, TreeStreamerOptions as LsOptions}, BlobId, DataId,
+        PackedId,
     },
+    cancel::*,
     commands::{
         backup::{BackupOptions, ParentOptions},
-        check::{CheckOptions, CheckResults, ReadSubsetOption, CheckErrorLevel, CheckError},
+        check::{CheckError, CheckErrorLevel, CheckOptions, CheckResults, ReadSubsetOption},
         config::ConfigOptions,
         copy::CopySnapshot,
         forget::{ForgetGroup, ForgetGroups, ForgetSnapshot, KeepOptions},
@@ -149,20 +150,20 @@ pub use crate::{
         prune::{LimitOption, PruneOptions, PrunePlan, PruneStats},
         repair::{index::RepairIndexOptions, snapshots::RepairSnapshotsOptions},
         repoinfo::{BlobInfo, IndexInfos, PackInfo, RepoFileInfo, RepoFileInfos},
-        restore::{FileDirStats, RestoreOptions, RestorePlan, RestoreStats, RestoreBias},
+        restore::{FileDirStats, RestoreBias, RestoreOptions, RestorePlan, RestoreStats},
     },
-    error::{ErrorKind, RusticError, RusticResult, Severity, Status, RusticJobError, RusticJobResult},
+    error::{ErrorKind, RusticError, RusticJobError, RusticJobResult, RusticResult, Severity, Status},
     id::{HexId, Id},
     progress::{NoProgress, NoProgressBars, Progress, ProgressBars},
     repofile::snapshotfile::{
         PathList, SnapshotGroup, SnapshotGroupCriterion, SnapshotOptions, StringList,
     },
     repository::{
-        FullIndex, IdIndex, IndexedFull, IndexedIds, IndexedStatus, IndexedTree, Open, OpenStatus,
-        Repository, RepositoryOptions, RepoIndexed,
-        command_input::{CommandInput, CommandInputErrorKind},
+        command_input::{CommandInput, CommandInputErrorKind}, FullIndex, IdIndex, IndexedFull, IndexedIds, IndexedStatus, IndexedTree, Open,
+        OpenStatus, RepoIndexed, Repository,
+        RepositoryOptions,
     },
-    cancel::*,
+    arbhx::VfsRepo,
 };
 
 pub fn join_force(base: impl AsRef<Path>, p: impl AsRef<Path>) -> PathBuf {

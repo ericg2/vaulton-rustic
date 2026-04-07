@@ -3,18 +3,27 @@
 use derive_setters::Setters;
 use log::{debug, error, info, trace, warn};
 
-use crate::backend::data::DataLocation;
+use crate::backend::DataFile;
 use crate::blob::Blob;
 use crate::blob::tree::TreeStreamerOptions;
 use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
 use crate::repository::NodeIterator;
-use crate::{DataBackends, DataFile, FileOpHandle, Id, backend::{
-    FileType, ReadBackend,
-    decrypt::DecryptReadBackend,
-    node::{Node, NodeType},
-}, error::{ErrorKind, RusticError, RusticResult}, progress::{Progress, ProgressBars}, repofile::packfile::PackId, repository::{IndexedFull, IndexedTree, Open, Repository}, RepoFilterOptions};
+use crate::{
+    DataBackends, Id, RepoFilterOptions,
+    backend::{
+        FileType, ReadBackend,
+        decrypt::DecryptReadBackend,
+        node::{Node, NodeType},
+    },
+    error::{ErrorKind, RusticError, RusticResult},
+    progress::{Progress, ProgressBars},
+    repofile::packfile::PackId,
+    repository::{IndexedFull, IndexedTree, Open, Repository},
+};
 use crate::{LsOptions, join_force};
+use arbhx_core::Metadata;
+use arbhx_core::blocking::DataWriteSeekCompat;
 use bytes::Bytes;
 use chrono::{DateTime, Local, Utc};
 use ignore::{DirEntry, WalkBuilder};
@@ -228,21 +237,21 @@ where
 
     let dest = dest_be.repository();
     let mut stats = RestoreStats::default();
-    let mut restore_infos = RestorePlan::new(dest.clone(), dest_path);
+    let mut restore_infos = RestorePlan::new(dest_be.clone(), dest_path);
     let mut additional_existing = false;
     let mut removed_dir = None;
-    let mut process_existing = |entry: &DataFile| -> RusticResult<_> {
-        if entry.path() == dest.get_backup_abs(dest_path) {
+    let mut process_existing = |entry: &Metadata| -> RusticResult<_> {
+        if entry.path() == dest.realpath(dest_path) {
             // don't process the root dir which should be existing
             return Ok(());
         }
         debug!("additional {}", entry.path().display());
-        if entry.metadata().is_dir {
+        if entry.is_dir() {
             stats.dirs.additional += 1;
         } else {
             stats.files.additional += 1;
         }
-        match (opts.delete, dry_run, entry.metadata().is_dir) {
+        match (opts.delete, dry_run, entry.is_dir()) {
             (true, true, true) => {
                 info!(
                     "would have removed the additional dir: {}",
@@ -259,7 +268,15 @@ where
                 let path = entry.path();
                 match &removed_dir {
                     Some(dir) if path.starts_with(dir) => {}
-                    _ => match dest.remove_dir(&path) {
+                    _ => match dest
+                        .clone()
+                        .writer()
+                        .ok_or(RusticError::new(
+                            ErrorKind::Backend,
+                            "Delete mode enabled, but backend is not writable",
+                        ))?
+                        .remove_dir(&path)
+                    {
                         Ok(()) => {
                             removed_dir = Some(path.to_path_buf());
                         }
@@ -270,7 +287,15 @@ where
                 }
             }
             (true, false, false) => {
-                if let Err(err) = dest.remove_file(&entry.path()) {
+                if let Err(err) = dest
+                    .clone()
+                    .writer()
+                    .ok_or(RusticError::new(
+                        ErrorKind::Backend,
+                        "Delete mode enabled, but backend is not writable",
+                    ))?
+                    .remove_file(&entry.path())
+                {
                     error!("error removing {}: {err}", entry.path().display());
                 }
             }
@@ -292,7 +317,14 @@ where
                     stats.dirs.restore += 1;
                     debug!("to restore: {}", path.display());
                     if !dry_run {
-                        dest.create_dir(&join_force(dest_path, path))
+                        dest
+                            .clone()
+                            .writer()
+                            .ok_or(RusticError::new(
+                                ErrorKind::Backend,
+                                "Restore backend is not writable",
+                            ))?
+                            .create_dir(&join_force(dest_path, path))
                             .map_err(|err| {
                                 RusticError::with_source(
                                     ErrorKind::InputOutput,
@@ -345,31 +377,31 @@ where
     };
 
     token.ensure_good(&p)?;
-    // let mut dst_iter = WalkBuilder::new(dest_path)
-    //     .follow_links(false)
-    //     .hidden(false)
-    //     .ignore(false)
-    //     .sort_by_file_path(Path::cmp)
-    //     .build()
-    //     .inspect(|r| {
-    //         if let Err(err) = r {
-    //             error!("Error during collection of files: {err:?}");
-    //         }
-    //     })
-    //     .filter_map(Result::ok);
-
     // First, make sure all folders exist for our restore point!
-    dest.create_dir(dest_path).map_err(|err| {
-        RusticError::with_source(
-            ErrorKind::InputOutput,
-            "Failed to create the `{dest_path}`.",
-            err,
-        )
-    })?;
+    dest.clone()
+        .writer()
+        .ok_or(RusticError::new(
+            ErrorKind::Backend,
+            "Restore backend is not writable",
+        ))?
+        .create_dir(dest_path)
+        .map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Failed to create the `{dest_path}`.",
+                err,
+            )
+        })?;
 
     let mut dst_iter = dest
-        .read_dir_filtered(dest_path, None, true) // NEEDS TO BE ABSOLUTE
-        .and_then(|x| x.get_iter())
+        .clone()
+        .reader()
+        .ok_or(RusticError::new(
+            ErrorKind::Backend,
+            "Restore backend is not readable!",
+        ))?
+        .read_dir(dest_path, None, true, true) // NEEDS TO BE ABSOLUTE
+        .and_then(|x| x.stream())
         .map_err(|err| {
             RusticError::with_source(
                 ErrorKind::InputOutput,
@@ -391,7 +423,7 @@ where
                 next_dst = dst_iter.next();
             }
             (Some(destination), Some((path, node))) => {
-                let abs_path = &dest.get_backup_abs(dest_path);
+                let abs_path = &dest.realpath(dest_path);
                 let cmp_path = join_force(abs_path, path);
                 trace!("Comparing {:?} to {:?}", &destination.path(), &cmp_path);
                 match destination.path().cmp(&cmp_path) {
@@ -402,8 +434,8 @@ where
                     }
                     Ordering::Equal => {
                         // process existing node
-                        if (node.is_dir() && !destination.metadata().is_dir)
-                            || (node.is_file() && destination.metadata().is_dir)
+                        if (node.is_dir() && !destination.is_dir())
+                            || (node.is_file() && destination.is_dir())
                             || node.is_special()
                         {
                             // if types do not match, first remove the existing file
@@ -454,7 +486,7 @@ where
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     opts: &RestoreOptions,
-    dest: &Arc<dyn DataLocation>,
+    dest: &DataBackends,
 ) -> RusticResult<()> {
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
@@ -497,7 +529,7 @@ fn restore_metadata(
 /// If the metadata could not be set.
 // TODO: Return a result here, introduce errors and get rid of logging.
 pub(crate) fn set_metadata(
-    dest: &Arc<dyn DataLocation>,
+    dest: &DataBackends,
     opts: &RestoreOptions,
     path: &PathBuf,
     node: &Node,
@@ -549,7 +581,7 @@ pub(crate) fn set_metadata(
 #[allow(clippy::too_many_lines)]
 fn restore_contents<P, S>(
     repo: &Repository<P, S>,
-    dest: &Arc<dyn DataLocation>,
+    dest: &DataBackends,
     token: JobCancelToken,
     file_infos: RestorePlan,
 ) -> RusticJobResult<()>
@@ -586,10 +618,14 @@ where
         })?;
 
     // create empty files first
+    let w = dest.repository().writer().ok_or(RusticError::new(
+        ErrorKind::Backend,
+        "Backend does not support writing for restore!",
+    ))?;
     for (i, size) in file_lengths.iter().enumerate() {
         if *size == 0 {
             let path = join_force(dest_path, &filenames[i]);
-            dest.set_length(&path, 0).map_err(|err| {
+            w.set_length(&path, 0).map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::InputOutput,
                     "Failed to set the length of the file `{path}`.",
@@ -650,8 +686,7 @@ where
                 let mut handle = dest
                     .get_existing(&src_path)
                     .unwrap()
-                    .unwrap()
-                    .open_read()
+                    .open_read_full()
                     .unwrap();
                 handle.seek(SeekFrom::Start(src_offset)).unwrap();
                 Bytes::from(crate::read_at(&mut handle, src_offset, src_len as usize).unwrap())
@@ -673,9 +708,10 @@ where
         }
         let path = join_force(dest_path, &filenames[file_idx]);
         let d_file = dest.ensure_file(&path).unwrap();
-        if d_file.can_full() {
+        if true {
+            // TODO: FIXME: implement this!
             // Random-write mode: write each blob directly at its intended offset
-            let mut handle = d_file.open_full().unwrap();
+            let mut handle = d_file.open_write_full().unwrap();
             for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
                 entries
             {
@@ -703,7 +739,7 @@ where
             handle.close().unwrap();
         } else {
             let mut expected_offset: u64 = 0;
-            let mut writer = d_file.open_append(true).unwrap();
+            let mut writer = d_file.open_write(true).unwrap();
             for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
                 entries
             {
@@ -768,11 +804,11 @@ pub struct RestorePlan {
     /// Statistics about the restore.
     pub stats: RestoreStats,
     /// The backend to restore to...
-    pub be: Arc<dyn DataLocation>,
+    pub be: DataBackends,
 }
 
 impl RestorePlan {
-    pub fn new(be: Arc<dyn DataLocation>, dest_path: impl AsRef<Path>) -> Self {
+    pub fn new(be: DataBackends, dest_path: impl AsRef<Path>) -> Self {
         Self {
             be,
             dest_path: dest_path.as_ref().to_path_buf(),
@@ -858,7 +894,7 @@ impl RestorePlan {
     ) -> RusticResult<AddFileResult> {
         let dest = dest_be.repository();
         let path = join_force(abs_path, &name);
-        let open_file = dest
+        let open_file = dest_be
             .get_matching_file(&path, file.meta.size)
             .map_err(|err| {
                 RusticError::with_source(ErrorKind::InputOutput, "Failed to get matching file", err)
@@ -866,8 +902,8 @@ impl RestorePlan {
 
         // Check empty files first
         if file.meta.size == 0 {
-            if let Some(meta) = open_file.as_ref().map(|x| x.metadata()) {
-                if meta.size == 0 {
+            if let Some(meta) = open_file.as_ref().map(|x| x.meta.clone()) {
+                if meta.size() == 0 {
                     return Ok(AddFileResult::Existing);
                 }
             }
@@ -875,11 +911,11 @@ impl RestorePlan {
 
         // Check mtime if not ignoring it
         if !ignore_mtime {
-            if let Some(meta) = open_file.as_ref().map(|x| x.metadata()) {
+            if let Some(meta) = open_file.as_ref().map(|x| x.meta.clone()) {
                 let mtime = meta
-                    .mtime
+                    .mtime()
                     .map(|t| DateTime::<Utc>::from(t).with_timezone(&Local));
-                if meta.size == file.meta.size && mtime == file.meta.mtime {
+                if meta.size() == file.meta.size && mtime == file.meta.mtime {
                     debug!(
                         "file {} exists with suitable size and mtime, accepting it!",
                         name.display()
@@ -899,13 +935,23 @@ impl RestorePlan {
         let mut open = if let Some(ref file) = open_file
             && dest_be.bias() == RestoreBias::PreferDownloads
         {
-            Some(file.open_read().map_err(|err| {
-                RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Failed to open file for verification",
-                    err,
-                )
-            })?)
+            Some(
+                file.be
+                    .clone()
+                    .reader()
+                    .ok_or(RusticError::new(
+                        ErrorKind::Backend,
+                        "Backend does not support reading!",
+                    ))?
+                    .open_read_start(&file.path)
+                    .map_err(|err| {
+                        RusticError::with_source(
+                            ErrorKind::InputOutput,
+                            "Failed to open file for verification",
+                            err,
+                        )
+                    })?,
+            )
         } else {
             None
         };
@@ -943,8 +989,8 @@ impl RestorePlan {
             file_pos += length;
         }
 
-        // For backends that don’t support random writes, mark all segments unmatched
-        if has_unmatched && !dest_be.supports_random() {
+        // For backends that don’t support random writes, mark all segments unmatched TODO: FIXME:
+        if has_unmatched /*&& !dest_be.supports_random()*/ {
             for id in file.content.iter().flatten() {
                 let ie = repo.get_index_entry(id)?;
                 for ((pack_id, _), file_locs) in self.r.iter_mut() {

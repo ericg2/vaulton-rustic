@@ -1,6 +1,5 @@
 //! Module for backend related functionality.
 pub(crate) mod cache;
-pub(crate) mod data;
 pub(crate) mod decrypt;
 pub(crate) mod dry_run;
 pub(crate) mod filters;
@@ -9,21 +8,23 @@ pub(crate) mod ignore;
 pub(crate) mod node;
 pub(crate) mod warm_up;
 
+use arbhx_core::blocking::{
+    DataReadCompat, DataReadSeekCompat, DataWriteCompat, DataWriteSeekCompat, SizedQueryCompat,
+    VfsBackendCompat, VfsReaderCompat, VfsWriterCompat,
+};
+use arbhx_core::{FilterOptions, VfsBackend};
 use bytes::Bytes;
 use enum_map::Enum;
 use log::trace;
-use std::path::Path;
-use std::{io::Read, ops::Deref, path::PathBuf, sync::Arc};
-
 #[cfg(test)]
 use mockall::mock;
-
 use serde_derive::{Deserialize, Serialize};
+use std::path::Path;
+use std::{io, io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 use crate::commands::restore::RestoreBias;
 use crate::{ErrorKind, PathList, RusticError};
 pub(crate) use crate::{
-    backend::data::{DataFile, DataLocation},
     backend::filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions},
     backend::node::{Metadata, Node, NodeType},
     error::RusticResult,
@@ -246,9 +247,10 @@ pub trait FindInBackend: ReadBackend {
         ids.iter()
             .map(|id| id.as_ref().parse())
             .collect::<RusticResult<Vec<_>>>()
-            .or_else(|err|{
+            .or_else(|err| {
                 trace!("no valid IDs given: {err}, searching for ID starting with given strings instead");
-                self.find_starts_with(tpe, ids)})
+                self.find_starts_with(tpe, ids)
+            })
     }
 }
 
@@ -381,53 +383,6 @@ impl std::fmt::Debug for dyn WriteBackend {
     }
 }
 
-/// Trait for backends that can read from a source.
-///
-/// This trait is implemented by all backends that can read data from a source.
-pub trait DataLister: Sync + Send {
-    /// Returns the size of the source (in bytes).
-    ///
-    /// # Errors
-    ///
-    /// * If the size could not be determined.
-    ///
-    /// # Returns
-    ///
-    /// The size of the source, if it is known.
-    fn size(&self) -> std::io::Result<Option<u64>>;
-
-    /// Returns the filtering options of the source
-    ///
-    /// # Returns
-    ///
-    /// The [`DataFilterOptions`] if available.
-    fn options(&self) -> DataFilterOptions;
-
-    /// Returns the iterator of the source
-    ///
-    /// # Returns
-    ///
-    /// The iterator.
-    fn get_iter(self: Arc<Self>) -> std::io::Result<Box<dyn DataIterator>>;
-
-    /// Returns the `[Path]` of the lister root.
-    ///
-    /// # Returns
-    ///
-    /// The path.
-    fn path(&self) -> &Path;
-}
-
-pub trait DataIterator: Send + Sync
-where
-    Self: Iterator<Item = std::io::Result<DataFile>>,
-    Self: Send, // ensures the iterator itself can be sent across threads
-    Self: Sync,
-{
-}
-
-impl<T> DataIterator for T where T: Iterator<Item = std::io::Result<DataFile>> + Send + Sync {}
-
 /// Trait for backends that can write to a source.
 ///
 /// This trait is implemented by all backends that can write data to a source.
@@ -515,18 +470,202 @@ impl RepositoryBackends {
 
 #[derive(Clone)]
 pub struct DataBackends {
-    data: Arc<dyn DataLocation>,
+    data: Arc<dyn VfsBackendCompat>,
     bias: RestoreBias,
 }
 
+#[derive(Clone)]
+pub struct BackupQuery {
+    pub(crate) path: PathBuf,
+    pub(crate) be: Arc<dyn VfsBackendCompat>,
+    pub(crate) inner: Arc<dyn SizedQueryCompat>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DataFile {
+    pub path: PathBuf,
+    pub meta: arbhx_core::Metadata,
+    pub be: Arc<dyn VfsBackendCompat>,
+}
+
+impl From<arbhx_core::Metadata> for Metadata {
+    fn from(value: arbhx_core::Metadata) -> Self {
+        Self {
+            mode: None,
+            mtime: value.mtime().map(|x|x.into()),
+            atime: value.atime().map(|x|x.into()),
+            ctime: None,
+            uid: None,
+            gid: None,
+            user: None,
+            group: None,
+            inode: 0,
+            device_id: 0,
+            size: value.size(),
+            links: 0,
+            x_attrs: vec![],
+        }
+    }
+}
+
+impl DataFile {
+    pub fn new(path: &Path, meta: arbhx_core::Metadata, be: Arc<dyn VfsBackendCompat>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            meta,
+            be,
+        }
+    }
+
+    pub fn node(&self) -> Node {
+        Node::new_node(
+            self.meta.name(),
+            match self.meta.is_dir() {
+                true => NodeType::Dir,
+                false => NodeType::File,
+            },
+            self.metadata().into(),
+        )
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn metadata(&self) -> arbhx_core::Metadata {
+        self.meta.clone()
+    }
+
+    pub fn open_read(&self) -> RusticResult<Box<dyn DataReadCompat>> {
+        self.be
+            .clone()
+            .reader()
+            .ok_or(RusticError::new(
+                ErrorKind::Backend,
+                "Reading is not supported",
+            ))?
+            .open_read_start(&self.path)
+            .map_err(|e| {
+                RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open read", e)
+            })
+    }
+    pub fn open_read_full(&self) -> RusticResult<Box<dyn DataReadSeekCompat>> {
+        self.be
+            .clone()
+            .reader()
+            .ok_or(RusticError::new(
+                ErrorKind::Backend,
+                "Reading is not supported",
+            ))?
+            .open_read_random(&self.path)
+            .map_err(|e| {
+                RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open read", e)
+            })?
+            .ok_or(RusticError::new(
+                ErrorKind::InputOutput,
+                "Backend does not support random reads",
+            ))
+    }
+    pub fn open_write(&self, overwrite: bool) -> RusticResult<Box<dyn DataWriteCompat>> {
+        self.be
+            .clone()
+            .writer()
+            .ok_or(RusticError::new(
+                ErrorKind::Backend,
+                "Writing is not supported",
+            ))?
+            .open_write_append(&self.path, overwrite)
+            .map_err(|e| {
+                RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open write", e)
+            })
+    }
+    pub fn open_write_full(&self) -> RusticResult<Box<dyn DataWriteSeekCompat>> {
+        self.be
+            .clone()
+            .writer()
+            .ok_or(RusticError::new(
+                ErrorKind::Backend,
+                "Writing is not supported",
+            ))?
+            .open_write_random(&self.path)
+            .map_err(|e| {
+                RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open write", e)
+            })?
+            .ok_or(RusticError::new(
+                ErrorKind::InputOutput,
+                "Backend does not support random writes",
+            ))
+    }
+}
+
 impl DataBackends {
-    pub fn new(data: Arc<dyn DataLocation>, bias: RestoreBias) -> Self {
+    pub fn new(data: Arc<dyn VfsBackendCompat>, bias: RestoreBias) -> Self {
         Self { data, bias }
     }
 
+    fn reader(&self) -> RusticResult<Arc<dyn VfsReaderCompat>> {
+        self.data
+            .clone()
+            .reader()
+            .ok_or(RusticError::new(ErrorKind::Backend, "Read not supported"))
+    }
+
+    fn writer(&self) -> RusticResult<Arc<dyn VfsWriterCompat>> {
+        self.data
+            .clone()
+            .writer()
+            .ok_or(RusticError::new(ErrorKind::Backend, "Write not supported"))
+    }
+
     #[must_use]
-    pub fn repository(&self) -> Arc<dyn DataLocation> {
+    pub fn repository(&self) -> Arc<dyn VfsBackendCompat> {
         self.data.clone()
+    }
+
+    pub fn get_matching_file(
+        &self,
+        path: impl AsRef<Path>,
+        size: u64,
+    ) -> RusticResult<Option<DataFile>> {
+        let path = path.as_ref();
+        let ret = self.reader()?.get_metadata(path).map_err(|e| {
+            RusticError::with_source(ErrorKind::InputOutput, "Failed to get data", e)
+        })?;
+        if let Some(x) = ret {
+            if x.size() == size {
+                let file = DataFile::new(path, x, self.data.clone());
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_existing(&self, path: impl AsRef<Path>) -> RusticResult<DataFile> {
+        let path = path.as_ref();
+        let ret = self.reader()?.get_metadata(path).map_err(|e| {
+            RusticError::with_source(ErrorKind::InputOutput, "Failed to get data", e)
+        })?;
+        match ret {
+            Some(x) => Ok(DataFile::new(path, x, self.data.clone())),
+            None => Err(RusticError::new(ErrorKind::InputOutput, "Item not found")),
+        }
+    }
+
+    pub fn ensure_file(&self, path: impl AsRef<Path>) -> RusticResult<DataFile> {
+        let path = path.as_ref();
+        let ret = self.reader()?.get_metadata(path).map_err(|e| {
+            RusticError::with_source(ErrorKind::InputOutput, "Failed to get data", e)
+        })?;
+        match ret {
+            Some(x) => Ok(DataFile::new(path, x, self.data.clone())),
+            None => {
+                // 4-7-26: Attempt to create the file!
+                self.writer()?.set_length(path, 0).map_err(|err| {
+                    RusticError::with_source(ErrorKind::InputOutput, "Failed to set length!", err)
+                })?;
+                self.get_existing(path)
+            }
+        }
     }
 
     pub fn bias(&self) -> RestoreBias {
@@ -536,20 +675,29 @@ impl DataBackends {
     pub(crate) fn prepare_backup(
         &self,
         path: impl AsRef<Path>,
-        opts: DataFilterOptions,
-    ) -> RusticResult<Arc<dyn DataLister>> {
-        self.data
-            .read_dir_filtered(path.as_ref(), Some(opts), true)
+        opts: FilterOptions,
+    ) -> RusticResult<BackupQuery> {
+        let path = path.as_ref();
+        let inner = self
+            .data
+            .clone()
+            .reader()
+            .ok_or(RusticError::new(
+                ErrorKind::Backend,
+                "Failed to prepare backup. Source does not support reading.",
+            ))?
+            .read_dir(path, Some(opts), true, false)
             .map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::Backend,
                     "Failed to prepare backup. Please check all file paths.",
                     err,
                 )
-            })
-    }
-
-    pub fn supports_random(&self) -> bool {
-        self.data.supports_random()
+            })?;
+        Ok(BackupQuery {
+            path: path.to_path_buf(),
+            be: self.data.clone(),
+            inner,
+        })
     }
 }

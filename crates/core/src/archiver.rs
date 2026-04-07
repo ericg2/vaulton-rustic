@@ -17,7 +17,7 @@ use crate::{
         file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
         tree_archiver::TreeArchiver,
     },
-    backend::{DataLister, decrypt::DecryptFullBackend},
+    backend::{decrypt::DecryptFullBackend},
     blob::BlobType,
     error::{ErrorKind, RusticError, RusticResult},
     index::{
@@ -26,6 +26,7 @@ use crate::{
     },
     repofile::{configfile::ConfigFile, snapshotfile::SnapshotFile},
 };
+use crate::backend::{BackupQuery, DataFile};
 
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
 /// Tree stack empty
@@ -62,6 +63,7 @@ pub struct Archiver<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> {
     /// The `SnapshotFile` to write to.
     snap: SnapshotFile,
 }
+
 
 impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// Creates a new `Archiver`.
@@ -128,7 +130,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     pub fn archive(
         mut self,
         abs_path: &Path,
-        src: Arc<dyn DataLister>,
+        src: BackupQuery,
         backup_path: &Path,
         as_path: Option<&PathBuf>,
         skip_identical_parent: bool,
@@ -143,7 +145,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             token.ensure_good(p)?;
             let src_size_handle = s.spawn(move || {
                 if !no_scan && !p.is_hidden() {
-                    match src1.size() {
+                    match src1.inner.size() {
                         Ok(Some(size)) => p.set_length(size),
                         Ok(None) => {}
                         Err(err) => warn!("error determining backup size: {}", err),
@@ -154,7 +156,8 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             // filter out errors and handle as_path
             token.ensure_good(p)?;
             let iter = src2
-                .get_iter()
+                .inner
+                .stream()
                 .map_err(|x| {
                     RusticError::with_source(
                         ErrorKind::InputOutput,
@@ -172,10 +175,10 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                                 warn!("ignoring error: {}", err);
                                 None
                             }
-                            Ok(x) => {
-                                let path = x.path();
-                                let node = x.node();
-                                let open = x.handle();
+                            Ok(meta) => {
+                                let path = meta.path().to_path_buf();
+                                let file = DataFile::new(&path, meta.clone(), src.be.clone());
+                                let node = file.node();
                                 if path == abs_path {
                                     return None; // *** MAKE SURE IT'S NOT ROOT!
                                 }
@@ -187,18 +190,16 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                                     path
                                 };
 
-                                Some(if node.is_dir() {
-                                    //print!("Found dir {:?} {:?}", &snapshot_path, &node);
-                                    (snapshot_path, node, open)
+                                Some(if meta.is_dir() {
+                                    (snapshot_path, node, file)
                                 } else {
-                                    //print!("Found file {:?} {:?}", &snapshot_path, &node);
                                     (
                                         snapshot_path
                                             .parent()
                                             .expect("file path should have a parent!")
                                             .to_path_buf(),
                                         node,
-                                        open,
+                                        file,
                                     )
                                 })
                             }

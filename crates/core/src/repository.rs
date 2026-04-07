@@ -14,64 +14,51 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
+use arbhx_core::FilterOptions;
+use crate::{DataBackends, RepoFilterOptions, RepositoryBackends, RusticError, backend::{
+    FileType, FindInBackend, ReadBackend, WriteBackend,
+    cache::{Cache, CachedBackend},
+    decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
+    hotcold::HotColdBackend,
+    node::Node,
+    warm_up::WarmUpAccessBackend,
+}, blob::{
+    BlobId, BlobType, PackedId,
+    tree::{FindMatches, FindNode, NodeStreamer, TreeId, TreeStreamerOptions as LsOptions},
+}, commands::{
+    self,
+    backup::BackupOptions,
+    check::{CheckOptions, CheckResults, check_repository},
+    config::ConfigOptions,
+    copy::CopySnapshot,
+    forget::{ForgetGroups, KeepOptions},
+    key::{KeyOptions, add_current_key_to_repo},
+    prune::{PruneOptions, PrunePlan, prune_repository},
+    repair::{
+        index::{RepairIndexOptions, index_checked_from_collector, repair_index},
+        snapshots::{RepairSnapshotsOptions, repair_snapshots},
+    },
+    repoinfo::{IndexInfos, RepoFileInfos},
+    restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
+}, crypto::aespoly1305::Key, error::{ErrorKind, RusticResult}, index::{
+    GlobalIndex, IndexEntry, ReadGlobalIndex, ReadIndex,
+    binarysorted::{IndexCollector, IndexType},
+}, progress::{NoProgressBars, Progress, ProgressBars}, repofile::{
+    ConfigFile, KeyId, PathList, RepoFile, RepoId, SnapshotFile, SnapshotSummary, Tree,
+    configfile::ConfigId,
+    keyfile::find_key_in_backend,
+    packfile::PackId,
+    snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
+}, repository::{
+    command_input::CommandInput,
+    warm_up::{warm_up, warm_up_wait},
+}, vfs::OpenFile, VfsRepo};
 
-use crate::{
-    DataBackends, DataFilterOptions, DataLister, RepoFilterOptions, RepositoryBackends,
-    RusticError,
-    backend::{
-        FileType, FindInBackend, ReadBackend, WriteBackend,
-        cache::{Cache, CachedBackend},
-        decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
-        hotcold::HotColdBackend,
-        node::Node,
-        warm_up::WarmUpAccessBackend,
-    },
-    blob::{
-        BlobId, BlobType, PackedId,
-        tree::{FindMatches, FindNode, NodeStreamer, TreeId, TreeStreamerOptions as LsOptions},
-    },
-    commands::{
-        self,
-        backup::BackupOptions,
-        check::{CheckOptions, CheckResults, check_repository},
-        config::ConfigOptions,
-        copy::CopySnapshot,
-        forget::{ForgetGroups, KeepOptions},
-        key::{KeyOptions, add_current_key_to_repo},
-        prune::{PruneOptions, PrunePlan, prune_repository},
-        repair::{
-            index::{RepairIndexOptions, index_checked_from_collector, repair_index},
-            snapshots::{RepairSnapshotsOptions, repair_snapshots},
-        },
-        repoinfo::{IndexInfos, RepoFileInfos},
-        restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
-    },
-    crypto::aespoly1305::Key,
-    error::{ErrorKind, RusticResult},
-    index::{
-        GlobalIndex, IndexEntry, ReadGlobalIndex, ReadIndex,
-        binarysorted::{IndexCollector, IndexType},
-    },
-    progress::{NoProgressBars, Progress, ProgressBars},
-    repofile::{
-        ConfigFile, KeyId, PathList, RepoFile, RepoId, SnapshotFile, SnapshotSummary, Tree,
-        configfile::ConfigId,
-        keyfile::find_key_in_backend,
-        packfile::PackId,
-        snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
-    },
-    repository::{
-        command_input::CommandInput,
-        warm_up::{warm_up, warm_up_wait},
-    },
-    vfs::OpenFile,
-};
-
-use crate::backend::data::DataLocation;
 use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
 #[cfg(feature = "clap")]
 use clap::ValueHint;
+use crate::vfs::{IdenticalSnapshot, Latest, Vfs};
 
 mod constants {
     /// Estimated item capacity used for cache in [`FullIndex`](super::FullIndex)
@@ -1702,6 +1689,17 @@ impl RepoIndexed {
     pub fn open_file(self: Arc<Self>, node: &Node) -> RusticResult<OpenFile> {
         OpenFile::from_node(self, node)
     }
+
+    pub fn get_vfs(self: Arc<Self>) -> RusticResult<VfsRepo> {
+        const PATH_TEMPLATE: &'static str = "[{hostname}]/[{label}]/{time}";
+        const TIME_TEMPLATE: &'static str = "%Y-%m-%d_%H-%M-%S";
+        let snaps = self.get_all_snapshots()?;
+        let vfs = Vfs::from_snapshots(snaps, &PATH_TEMPLATE, &TIME_TEMPLATE, Latest::AsDir, IdenticalSnapshot::AsDir)?;
+        Ok(VfsRepo {
+            vfs,
+            repo: self.clone(),
+        })
+    }
 }
 
 impl<P, S: IndexedFull> Repository<P, S> {
@@ -2011,7 +2009,7 @@ impl<P: ProgressBars, S: IndexedIds> Repository<P, S> {
         &self,
         src: &DataBackends,
         src_path: impl AsRef<Path>,
-        src_opts: &DataFilterOptions,
+        src_opts: &FilterOptions,
         opts: &BackupOptions,
         snap: SnapshotFile,
         token: JobCancelToken,
