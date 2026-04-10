@@ -1,6 +1,56 @@
 pub(crate) mod command_input;
 pub(crate) mod warm_up;
 
+use crate::{
+    DataBackends, RepoFilterOptions, RepositoryBackends, RusticError,
+    backend::{
+        FileType, FindInBackend, ReadBackend, WriteBackend,
+        cache::{Cache, CachedBackend},
+        decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
+        hotcold::HotColdBackend,
+        node::Node,
+        warm_up::WarmUpAccessBackend,
+    },
+    blob::{
+        BlobId, BlobType, PackedId,
+        tree::{FindMatches, FindNode, NodeStreamer, TreeId, TreeStreamerOptions as LsOptions},
+    },
+    commands::{
+        self,
+        backup::BackupOptions,
+        check::{CheckOptions, CheckResults, check_repository},
+        config::ConfigOptions,
+        copy::CopySnapshot,
+        forget::{ForgetGroups, KeepOptions},
+        key::{KeyOptions, add_current_key_to_repo},
+        prune::{PruneOptions, PrunePlan, prune_repository},
+        repair::{
+            index::{RepairIndexOptions, index_checked_from_collector, repair_index},
+            snapshots::{RepairSnapshotsOptions, repair_snapshots},
+        },
+        repoinfo::{IndexInfos, RepoFileInfos},
+        restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
+    },
+    crypto::aespoly1305::Key,
+    error::{ErrorKind, RusticResult},
+    index::{
+        GlobalIndex, IndexEntry, ReadGlobalIndex, ReadIndex,
+        binarysorted::{IndexCollector, IndexType},
+    },
+    progress::{NoProgressBars, Progress, ProgressBars},
+    repofile::{
+        ConfigFile, KeyId, PathList, RepoFile, RepoId, SnapshotFile, SnapshotSummary, Tree,
+        configfile::ConfigId,
+        keyfile::find_key_in_backend,
+        packfile::PackId,
+        snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
+    },
+    repository::{
+        command_input::CommandInput,
+        warm_up::{warm_up, warm_up_wait},
+    },
+};
+use arbhx_core::FilterOptions;
 use bytes::Bytes;
 use derive_setters::Setters;
 use log::{debug, error, info};
@@ -14,51 +64,13 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
-use arbhx_core::FilterOptions;
-use crate::{DataBackends, RepoFilterOptions, RepositoryBackends, RusticError, backend::{
-    FileType, FindInBackend, ReadBackend, WriteBackend,
-    cache::{Cache, CachedBackend},
-    decrypt::{DecryptBackend, DecryptReadBackend, DecryptWriteBackend},
-    hotcold::HotColdBackend,
-    node::Node,
-    warm_up::WarmUpAccessBackend,
-}, blob::{
-    BlobId, BlobType, PackedId,
-    tree::{FindMatches, FindNode, NodeStreamer, TreeId, TreeStreamerOptions as LsOptions},
-}, commands::{
-    self,
-    backup::BackupOptions,
-    check::{CheckOptions, CheckResults, check_repository},
-    config::ConfigOptions,
-    copy::CopySnapshot,
-    forget::{ForgetGroups, KeepOptions},
-    key::{KeyOptions, add_current_key_to_repo},
-    prune::{PruneOptions, PrunePlan, prune_repository},
-    repair::{
-        index::{RepairIndexOptions, index_checked_from_collector, repair_index},
-        snapshots::{RepairSnapshotsOptions, repair_snapshots},
-    },
-    repoinfo::{IndexInfos, RepoFileInfos},
-    restore::{RestoreOptions, RestorePlan, collect_and_prepare, restore_repository},
-}, crypto::aespoly1305::Key, error::{ErrorKind, RusticResult}, index::{
-    GlobalIndex, IndexEntry, ReadGlobalIndex, ReadIndex,
-    binarysorted::{IndexCollector, IndexType},
-}, progress::{NoProgressBars, Progress, ProgressBars}, repofile::{
-    ConfigFile, KeyId, PathList, RepoFile, RepoId, SnapshotFile, SnapshotSummary, Tree,
-    configfile::ConfigId,
-    keyfile::find_key_in_backend,
-    packfile::PackId,
-    snapshotfile::{SnapshotGroup, SnapshotGroupCriterion, SnapshotId},
-}, repository::{
-    command_input::CommandInput,
-    warm_up::{warm_up, warm_up_wait},
-}, vfs::OpenFile, VfsRepo};
 
 use crate::cancel::JobCancelToken;
 use crate::error::RusticJobResult;
+use crate::vfs::{IdenticalSnapshot, Latest, OpenFile, Vfs, VfsRepo};
 #[cfg(feature = "clap")]
 use clap::ValueHint;
-use crate::vfs::{IdenticalSnapshot, Latest, Vfs};
+use tokio::runtime::Handle;
 
 mod constants {
     /// Estimated item capacity used for cache in [`FullIndex`](super::FullIndex)
@@ -1690,13 +1702,20 @@ impl RepoIndexed {
         OpenFile::from_node(self, node)
     }
 
-    pub fn get_vfs(self: Arc<Self>) -> RusticResult<VfsRepo> {
+    pub fn get_vfs(self: Arc<Self>, handle: Handle) -> RusticResult<VfsRepo> {
         const PATH_TEMPLATE: &'static str = "[{hostname}]/[{label}]/{time}";
         const TIME_TEMPLATE: &'static str = "%Y-%m-%d_%H-%M-%S";
         let snaps = self.get_all_snapshots()?;
-        let vfs = Vfs::from_snapshots(snaps, &PATH_TEMPLATE, &TIME_TEMPLATE, Latest::AsDir, IdenticalSnapshot::AsDir)?;
+        let vfs = Vfs::from_snapshots(
+            snaps,
+            &PATH_TEMPLATE,
+            &TIME_TEMPLATE,
+            Latest::AsDir,
+            IdenticalSnapshot::AsDir,
+        )?;
         Ok(VfsRepo {
-            vfs,
+            handle,
+            vfs: Arc::new(vfs),
             repo: self.clone(),
         })
     }
@@ -2003,7 +2022,7 @@ impl<P: ProgressBars, S: IndexedIds> Repository<P, S> {
     // TODO: Document errors
     ///
     /// # Returns
-    ///  
+    ///
     /// The saved snapshot.
     pub fn backup(
         &self,
@@ -2015,7 +2034,6 @@ impl<P: ProgressBars, S: IndexedIds> Repository<P, S> {
         token: JobCancelToken,
     ) -> RusticJobResult<SnapshotFile> {
         commands::backup::backup(
-            src,
             src.prepare_backup(src_path, src_opts.clone())?,
             self,
             opts,
@@ -2086,7 +2104,7 @@ impl<P: ProgressBars, S: IndexedFull> Repository<P, S> {
     /// # Errors
     ///
     /// * If the node is not a file.
-    ///  
+    ///
     /// # Note
     ///
     /// Currently, only regular file nodes are supported.
@@ -2173,7 +2191,7 @@ impl<P: ProgressBars, S: IndexedFull> Repository<P, S> {
     /// * `opts` - The options to use
     /// * `snapshots` - The snapshots to repair
     /// * `dry_run` - If true, only print what would be done
-    ///  
+    ///
     /// # Warning
     ///
     /// * If you remove the original snapshots, you may loose data!

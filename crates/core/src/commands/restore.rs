@@ -400,7 +400,7 @@ where
             ErrorKind::Backend,
             "Restore backend is not readable!",
         ))?
-        .read_dir(dest_path, None, true, true) // NEEDS TO BE ABSOLUTE
+        .list(dest_path, None, true, true) // NEEDS TO BE ABSOLUTE
         .and_then(|x| x.stream())
         .map_err(|err| {
             RusticError::with_source(
@@ -708,8 +708,7 @@ where
         }
         let path = join_force(dest_path, &filenames[file_idx]);
         let d_file = dest.ensure_file(&path).unwrap();
-        if true {
-            // TODO: FIXME: implement this!
+        if dest.supports_random() {
             // Random-write mode: write each blob directly at its intended offset
             let mut handle = d_file.open_write_full().unwrap();
             for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
@@ -989,8 +988,8 @@ impl RestorePlan {
             file_pos += length;
         }
 
-        // For backends that don’t support random writes, mark all segments unmatched TODO: FIXME:
-        if has_unmatched /*&& !dest_be.supports_random()*/ {
+        // For backends that don’t support random writes, mark all segments unmatched
+        if has_unmatched && !dest_be.supports_random() {
             for id in file.content.iter().flatten() {
                 let ie = repo.get_index_entry(id)?;
                 for ((pack_id, _), file_locs) in self.r.iter_mut() {

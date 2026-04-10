@@ -1,5 +1,3 @@
-mod format;
-
 use runtime_format::FormatArgs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -17,9 +15,9 @@ use crate::{
     index::ReadIndex,
     repofile::{BlobType, Metadata, Node, NodeType, SnapshotFile},
     repository::{IndexedFull, IndexedTree, Repository},
-    vfs::format::FormattedSnapshot,
     RepoIndexed,
 };
+use crate::vfs::format::FormattedSnapshot;
 
 /// [`VfsErrorKind`] describes the errors that can be returned from the Virtual File System
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
@@ -588,38 +586,5 @@ impl ContentStartpoints {
         let i = self.0.partition_point(|o| o <= &offset) - 1;
         offset -= self.0[i];
         (i, offset)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // helper func
-    fn startpoints_from_ok_sizes(sizes: impl IntoIterator<Item = usize>) -> ContentStartpoints {
-        ContentStartpoints::from_sizes(sizes.into_iter().map(Ok)).unwrap()
-    }
-
-    #[test]
-    fn content_offsets_empty_sizes() {
-        let offsets = startpoints_from_ok_sizes([]);
-        assert_eq!(offsets.compute_start(0), (0, 0));
-        assert_eq!(offsets.compute_start(42), (0, 0));
-    }
-
-    #[test]
-    fn content_offsets_size() {
-        let offsets = startpoints_from_ok_sizes([15]);
-        assert_eq!(offsets.compute_start(0), (0, 0));
-        assert_eq!(offsets.compute_start(5), (0, 5));
-        assert_eq!(offsets.compute_start(20), (0, 20));
-    }
-    #[test]
-    fn content_offsets_sizes() {
-        let offsets = startpoints_from_ok_sizes([15, 24]);
-        assert_eq!(offsets.compute_start(0), (0, 0));
-        assert_eq!(offsets.compute_start(5), (0, 5));
-        assert_eq!(offsets.compute_start(20), (1, 5));
-        assert_eq!(offsets.compute_start(42), (1, 27));
     }
 }

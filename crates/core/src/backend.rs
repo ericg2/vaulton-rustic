@@ -23,13 +23,13 @@ use std::path::Path;
 use std::{io, io::Read, ops::Deref, path::PathBuf, sync::Arc};
 
 use crate::commands::restore::RestoreBias;
-use crate::{ErrorKind, PathList, RusticError};
 pub(crate) use crate::{
     backend::filters::{DataFilterOptions, DataSaveOptions, RepoFilterOptions},
     backend::node::{Metadata, Node, NodeType},
     error::RusticResult,
     id::Id,
 };
+use crate::{ErrorKind, PathList, RusticError};
 
 /// [`BackendErrorKind`] describes the errors that can be returned by the various Backends
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
@@ -472,6 +472,7 @@ impl RepositoryBackends {
 pub struct DataBackends {
     data: Arc<dyn VfsBackendCompat>,
     bias: RestoreBias,
+    random: bool,
 }
 
 #[derive(Clone)]
@@ -557,14 +558,10 @@ impl DataFile {
                 ErrorKind::Backend,
                 "Reading is not supported",
             ))?
-            .open_read_random(&self.path)
+            .open_read_seek(&self.path)
             .map_err(|e| {
                 RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open read", e)
-            })?
-            .ok_or(RusticError::new(
-                ErrorKind::InputOutput,
-                "Backend does not support random reads",
-            ))
+            })
     }
     pub fn open_write(&self, overwrite: bool) -> RusticResult<Box<dyn DataWriteCompat>> {
         self.be
@@ -574,7 +571,7 @@ impl DataFile {
                 ErrorKind::Backend,
                 "Writing is not supported",
             ))?
-            .open_write_append(&self.path, overwrite)
+            .open_write(&self.path, overwrite)
             .map_err(|e| {
                 RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open write", e)
             })
@@ -582,25 +579,21 @@ impl DataFile {
     pub fn open_write_full(&self) -> RusticResult<Box<dyn DataWriteSeekCompat>> {
         self.be
             .clone()
-            .writer()
+            .writer_seek()
             .ok_or(RusticError::new(
                 ErrorKind::Backend,
-                "Writing is not supported",
+                "Seek write is not supported",
             ))?
-            .open_write_random(&self.path)
+            .open_write_seek(&self.path)
             .map_err(|e| {
                 RusticError::with_source(ErrorKind::InputOutput, "Backend failed to open write", e)
-            })?
-            .ok_or(RusticError::new(
-                ErrorKind::InputOutput,
-                "Backend does not support random writes",
-            ))
+            })
     }
 }
 
 impl DataBackends {
     pub fn new(data: Arc<dyn VfsBackendCompat>, bias: RestoreBias) -> Self {
-        Self { data, bias }
+        Self { random: data.clone().writer_seek().is_some(), data, bias }
     }
 
     fn reader(&self) -> RusticResult<Arc<dyn VfsReaderCompat>> {
@@ -686,7 +679,7 @@ impl DataBackends {
                 ErrorKind::Backend,
                 "Failed to prepare backup. Source does not support reading.",
             ))?
-            .read_dir(path, Some(opts), true, false)
+            .list(path, Some(opts), true, false)
             .map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::Backend,
@@ -699,5 +692,9 @@ impl DataBackends {
             be: self.data.clone(),
             inner,
         })
+    }
+
+    pub fn supports_random(&self) -> bool {
+        self.random
     }
 }

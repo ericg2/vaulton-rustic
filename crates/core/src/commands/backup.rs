@@ -176,7 +176,7 @@ pub struct BackupOptions {
 /// The snapshot pointing to the backup'ed data.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn backup<P, S>(
-    data_be: &DataBackends,
+    //data_be: &DataBackends,
     src: BackupQuery,
     repo: &Repository<P, S>,
     opts: &BackupOptions,

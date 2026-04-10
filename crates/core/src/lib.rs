@@ -118,9 +118,8 @@ pub(crate) mod progress;
 pub mod repofile;
 pub(crate) mod repository;
 /// Virtual File System support - allows to act on the repository like on a file system
-pub mod vfs;
 pub(crate) mod cancel;
-pub(crate) mod arbhx;
+pub mod vfs;
 
 use std::io;
 use std::io::{Read, Seek, SeekFrom};
@@ -163,7 +162,6 @@ pub use crate::{
         OpenStatus, RepoIndexed, Repository,
         RepositoryOptions,
     },
-    arbhx::VfsRepo,
 };
 
 pub fn join_force(base: impl AsRef<Path>, p: impl AsRef<Path>) -> PathBuf {

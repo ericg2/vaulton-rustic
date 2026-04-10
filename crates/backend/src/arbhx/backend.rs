@@ -1,11 +1,11 @@
 use arbhx_core::blocking::{VfsBackendCompat, VfsReaderCompat, VfsWriterCompat};
 use arbhx_core::{VfsBackend, VfsReader, VfsWriter};
-use arbhx_sync::VfsBackendSync;
+use arbhx_sync::VfsCompat;
 use bytes::Bytes;
 use cached::once_cell::sync::Lazy;
 use log::{error, trace};
 use rustic_core::{
-    ALL_FILE_TYPES, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
+    ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend, ALL_FILE_TYPES,
 };
 use std::io;
 use std::io::{Read, SeekFrom, Write};
@@ -22,7 +22,7 @@ static HANDLE: Lazy<Handle> = Lazy::new(|| RUNTIME.handle().clone());
 
 #[derive(Clone, Debug)]
 pub struct ArbhxBackend {
-    pub(crate) be: Arc<VfsBackendSync>,
+    pub(crate) be: Arc<VfsCompat>,
     pub(crate) read: Arc<dyn VfsReaderCompat>,
     pub(crate) write: Arc<dyn VfsWriterCompat>,
 }
@@ -52,7 +52,7 @@ impl ArbhxBackend {
         .to_string()
     }
     pub fn new(be: Arc<dyn VfsBackend>) -> RusticResult<Self> {
-        let be = Arc::new(VfsBackendSync::new(HANDLE.clone(), be));
+        let be = Arc::new(VfsCompat::new(HANDLE.clone(), be));
         let read = be.clone().reader().ok_or(RusticError::new(
             ErrorKind::Backend,
             "Read operation is not supported",
@@ -98,7 +98,7 @@ impl ReadBackend for ArbhxBackend {
         }
 
         let path = tpe.dirname().to_string() + "/";
-        let ret = self.read.read_dir((&path).as_ref(), None, true, true).and_then(|x| x.stream()).map_err(|err| {
+        let ret = self.read.list((&path).as_ref(), None, true, true).and_then(|x| x.stream()).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Backend,
                 "Listing all files of `{type}` in directory `{path}` and their sizes failed in the backend. Please check if the given path is correct.",
@@ -158,7 +158,7 @@ impl ReadBackend for ArbhxBackend {
         }
 
         let path = tpe.dirname().to_string() + "/";
-        let ret = self.read.read_dir(path.as_ref(), None, true, true).and_then(|x| x.stream()).map_err(|err| {
+        let ret = self.read.list(path.as_ref(), None, true, true).and_then(|x| x.stream()).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Backend,
                 "Listing all files of `{type}` in directory `{path}` and their sizes failed in the backend. Please check if the given path is correct.",
@@ -207,7 +207,7 @@ impl ReadBackend for ArbhxBackend {
         let path = self.path(tpe, id);
         let mut file = self
             .read
-            .open_read_random(path.as_ref())
+            .open_read_seek(path.as_ref())
             .map_err(|err| {
                 RusticError::with_source(
                     ErrorKind::Backend,
@@ -215,11 +215,7 @@ impl ReadBackend for ArbhxBackend {
                     err,
                 )
                 .attach_context("path", &path)
-            })?
-            .ok_or(RusticError::new(
-                ErrorKind::Backend,
-                "The backend does not support random reads.",
-            ))?;
+            })?;
         _ = file.seek(SeekFrom::Start(offset.into())).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Backend,
@@ -295,7 +291,7 @@ impl WriteBackend for ArbhxBackend {
         trace!("writing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
         self.write
-            .open_write_append(filename.as_ref(), true)
+            .open_write(filename.as_ref(), true)
             .and_then(|mut x| {
                 x.write(&*buf)?;
                 x.flush()?;

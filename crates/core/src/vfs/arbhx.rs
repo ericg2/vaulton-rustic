@@ -1,5 +1,6 @@
-use crate::vfs::{OpenFile, Vfs};
-use crate::{RepoIndexed, join_force};
+use crate::RepoIndexed;
+use crate::vfs::fs::{OpenFile, Vfs};
+use crate::vfs::query::VfsQuery;
 use arbhx_core::{DataRead, DataReadSeek, FilterOptions, Metadata, SizedQuery, VfsReader};
 use async_trait::async_trait;
 use futures::io::AllowStdIo;
@@ -11,6 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::runtime::Handle;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 #[derive(Debug)]
@@ -41,10 +43,32 @@ impl AsyncSeek for Adapter {
     }
 }
 
+impl DataRead for Adapter {}
+
+impl DataReadSeek for Adapter {}
+
 #[derive(Debug)]
 pub struct VfsRepo {
+    pub(crate) handle: Handle,
     pub(crate) repo: Arc<RepoIndexed>,
-    pub(crate) vfs: Vfs,
+    pub(crate) vfs: Arc<Vfs>,
+}
+
+impl VfsRepo {
+    pub(crate) fn raw_meta(
+        repo: &RepoIndexed,
+        vfs: &Vfs,
+        path: impl AsRef<Path>,
+    ) -> Option<Metadata> {
+        vfs.node_from_path(&repo, path.as_ref()).ok().map(|node| {
+            Metadata::default()
+                .set_path(path.as_ref())
+                .set_is_dir(node.is_dir())
+                .set_size(node.meta.size)
+                .set_atime(node.meta.atime.map(|x| x.to_utc()))
+                .set_mtime(node.meta.mtime.map(|x| x.to_utc()))
+        })
+    }
 }
 
 #[async_trait]
@@ -56,35 +80,33 @@ impl VfsReader for VfsRepo {
         Ok(Box::new(Adapter { rdr }))
     }
 
-    async fn open_read_random(
-        &self,
-        item: &Path,
-    ) -> std::io::Result<Option<Box<dyn DataReadSeek>>> {
+    async fn open_read_seek(&self, item: &Path) -> std::io::Result<Box<dyn DataReadSeek>> {
         let node = self.vfs.node_from_path(&self.repo, item)?;
         let file = self.repo.clone().open_file(&node)?;
         let rdr = AllowStdIo::new(file).compat();
-        Ok(Some(Box::new(Adapter { rdr })))
+        Ok(Box::new(Adapter { rdr }))
     }
 
     async fn get_metadata(&self, item: &Path) -> std::io::Result<Option<Metadata>> {
-        let node = self.vfs.node_from_path(&self.repo, item).ok().map(|node| {
-            Metadata::default()
-                .set_path(item)
-                .set_is_dir(node.is_dir())
-                .set_size(node.meta.size)
-                .set_atime(node.meta.atime.map(|x| x.to_utc()))
-                .set_mtime(node.meta.mtime.map(|x| x.to_utc()))
-        });
-        Ok(node)
+        Ok(Self::raw_meta(&self.repo, &self.vfs, item))
     }
 
-    async fn read_dir(
+    async fn list(
         &self,
         item: &Path,
         opts: Option<FilterOptions>,
         recursive: bool,
         include_root: bool,
     ) -> std::io::Result<Arc<dyn SizedQuery>> {
-        todo!()
+        let handle = VfsQuery::new(
+            self.handle.clone(),
+            self.vfs.clone(),
+            self.repo.clone(),
+            item,
+            opts,
+            recursive,
+            include_root,
+        );
+        Ok(Arc::new(handle))
     }
 }
