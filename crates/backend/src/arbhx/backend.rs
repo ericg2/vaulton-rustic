@@ -67,7 +67,7 @@ impl ArbhxBackend {
 
 impl ReadBackend for ArbhxBackend {
     fn location(&self) -> String {
-        todo!()
+        "arbhx".to_string()
     }
 
     fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
