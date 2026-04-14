@@ -9,7 +9,7 @@ use crate::arbhx::ArbhxBackend;
 
 /// Options for a backend.
 #[derive(Clone, Default, Debug, Setters)]
-#[setters(into, strip_option)]
+#[setters(strip_option)]
 #[non_exhaustive]
 pub struct BackendOptions {
     /// Repository to use
