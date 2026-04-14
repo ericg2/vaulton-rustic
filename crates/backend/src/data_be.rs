@@ -27,8 +27,7 @@ use crate::arbhx::ArbhxBackend;
 /// Options for a backend.
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
 #[cfg_attr(feature = "merge", derive(conflate::Merge))]
-#[derive(Clone, Default, Debug, Setters)]
-#[setters(into, strip_option)]
+#[derive(Clone, Default, Debug)]
 #[non_exhaustive]
 pub struct DataBackendOptions {
     /// Repository to use
@@ -39,6 +38,14 @@ pub struct DataBackendOptions {
 }
 
 impl DataBackendOptions {
+    pub fn repository(mut self, be: Arc<dyn VfsBackend>) -> Self {
+        self.repository = Some(be);
+        self
+    }
+    pub fn bias(mut self, bias: RestoreBias) -> Self {
+        self.bias = bias;
+        self
+    }
     /// Convert the options to backends.
     ///
     /// # Errors

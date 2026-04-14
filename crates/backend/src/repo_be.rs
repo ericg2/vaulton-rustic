@@ -8,8 +8,7 @@ use rustic_core::{ErrorKind, RepositoryBackends, RusticError, RusticResult, Writ
 use crate::arbhx::ArbhxBackend;
 
 /// Options for a backend.
-#[derive(Clone, Default, Debug, Setters)]
-#[setters(strip_option)]
+#[derive(Clone, Default, Debug)]
 #[non_exhaustive]
 pub struct BackendOptions {
     /// Repository to use
@@ -20,6 +19,14 @@ pub struct BackendOptions {
 }
 
 impl BackendOptions {
+    pub fn repository(mut self, be: Arc<dyn VfsBackend>) -> Self {
+        self.repository = Some(be);
+        self
+    }
+    pub fn repo_hot(mut self, be: Arc<dyn VfsBackend>) -> Self {
+        self.repo_hot = Some(be);
+        self
+    }
     /// Convert the options to backends.
     ///
     /// # Errors
