@@ -15,10 +15,10 @@ use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
-static RUNTIME: Lazy<Runtime> =
-    Lazy::new(|| Runtime::new().expect("failed to create tokio runtime"));
-
-static HANDLE: Lazy<Handle> = Lazy::new(|| RUNTIME.handle().clone());
+// static RUNTIME: Lazy<Runtime> =
+//     Lazy::new(|| Runtime::new().expect("failed to create tokio runtime"));
+//
+// static HANDLE: Lazy<Handle> = Lazy::new(|| RUNTIME.handle().clone());
 
 #[derive(Clone, Debug)]
 pub struct ArbhxBackend {
@@ -51,8 +51,8 @@ impl ArbhxBackend {
         .unwrap()
         .to_string()
     }
-    pub fn new(be: Arc<dyn VfsBackend>) -> RusticResult<Self> {
-        let be = Arc::new(VfsCompat::new(HANDLE.clone(), be));
+    pub fn new(rt: Handle, be: Arc<dyn VfsBackend>) -> RusticResult<Self> {
+        let be = Arc::new(VfsCompat::new(rt, be));
         let read = be.clone().reader().ok_or(RusticError::new(
             ErrorKind::Backend,
             "Read operation is not supported",

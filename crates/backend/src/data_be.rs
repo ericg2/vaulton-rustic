@@ -3,7 +3,7 @@ use arbhx_core::VfsBackend;
 use derive_setters::Setters;
 use std::{collections::BTreeMap, sync::Arc};
 use strum_macros::{Display, EnumString};
-
+use tokio::runtime::Handle;
 use rustic_core::{
     DataBackends, ErrorKind, RepositoryBackends, RestoreBias, RusticError, RusticResult,
     WriteBackend,
@@ -55,12 +55,12 @@ impl DataBackendOptions {
     /// # Returns
     ///
     /// The backends for the repository.
-    pub fn to_backends(&self) -> RusticResult<DataBackends> {
+    pub fn to_backends(&self, rt: Handle) -> RusticResult<DataBackends> {
         let be = self.repository.clone().ok_or(RusticError::new(
             ErrorKind::Backend,
             "No repository given. Please make sure, that you have set the repository.",
         ))?;
-        let be = ArbhxBackend::new(be.clone())?;
+        let be = ArbhxBackend::new(rt, be.clone())?;
         let ret = Arc::new(be);
         Ok(DataBackends::new(ret.be.clone(), self.bias))
     }

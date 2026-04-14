@@ -3,7 +3,8 @@ use arbhx_core::VfsBackend;
 use derive_setters::Setters;
 use std::fmt::Debug;
 use std::{collections::BTreeMap, sync::Arc};
-
+use std::os::windows::io::HandleOrNull;
+use tokio::runtime::{Handle, Runtime};
 use rustic_core::{ErrorKind, RepositoryBackends, RusticError, RusticResult, WriteBackend};
 use crate::arbhx::ArbhxBackend;
 
@@ -36,14 +37,14 @@ impl BackendOptions {
     /// # Returns
     ///
     /// The backends for the repository.
-    pub fn to_backends(&self) -> RusticResult<RepositoryBackends> {
-        let be = self.get_backend(self.repository.clone())?.ok_or_else(|| {
+    pub fn to_backends(&self, rt: Handle) -> RusticResult<RepositoryBackends> {
+        let be = self.get_backend(rt.clone(), self.repository.clone())?.ok_or_else(|| {
             RusticError::new(
                 ErrorKind::Backend,
                 "No repository given. Please make sure, that you have set the repository.",
             )
         })?;
-        let be_hot = self.get_backend(self.repo_hot.clone())?;
+        let be_hot = self.get_backend(rt.clone(), self.repo_hot.clone())?;
         Ok(RepositoryBackends::new(be, be_hot))
     }
 
@@ -65,11 +66,12 @@ impl BackendOptions {
     #[allow(clippy::unused_self)]
     fn get_backend(
         &self,
+        rt: Handle,
         config: Option<Arc<dyn VfsBackend>>,
     ) -> RusticResult<Option<Arc<dyn WriteBackend>>> {
         match config {
             Some(x) => {
-                let be = ArbhxBackend::new(x.clone())?;
+                let be = ArbhxBackend::new(rt, x.clone())?;
                 let ret = Arc::new(be);
                 Ok(Some(ret))
             }
