@@ -1,19 +1,23 @@
 use crate::RepoIndexed;
 use crate::vfs::fs::{OpenFile, Vfs};
 use crate::vfs::query::VfsQuery;
-use arbhx_core::{DataRead, DataReadSeek, FilterOptions, Metadata, SizedQuery, VfsReader};
+use arbhx_core::{
+    DataRead, DataReadSeek, DataUsage, FilterOptions, Metadata, SizedQuery, VfsBackend, VfsFull,
+    VfsReader, VfsSeekWriter, VfsWriter,
+};
 use async_trait::async_trait;
 use futures::io::AllowStdIo;
 use std::fmt::Debug;
 use std::io;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tokio::runtime::Handle;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
+use uuid::Uuid;
 
 #[derive(Debug)]
 struct Adapter {
@@ -49,6 +53,7 @@ impl DataReadSeek for Adapter {}
 
 #[derive(Debug)]
 pub struct VfsRepo {
+    pub(crate) id: Uuid,
     pub(crate) handle: Handle,
     pub(crate) repo: Arc<RepoIndexed>,
     pub(crate) vfs: Arc<Vfs>,
@@ -68,6 +73,37 @@ impl VfsRepo {
                 .set_atime(node.meta.atime.map(|x| x.to_utc()))
                 .set_mtime(node.meta.mtime.map(|x| x.to_utc()))
         })
+    }
+}
+
+#[async_trait]
+impl VfsBackend for VfsRepo {
+    fn id(&self) -> Uuid {
+        self.id
+    }
+
+    fn realpath(&self, item: &Path) -> PathBuf {
+        item.to_path_buf()
+    }
+
+    fn reader(self: Arc<Self>) -> Option<Arc<dyn VfsReader>> {
+        Some(self.clone())
+    }
+
+    fn writer(self: Arc<Self>) -> Option<Arc<dyn VfsWriter>> {
+        None
+    }
+
+    fn writer_seek(self: Arc<Self>) -> Option<Arc<dyn VfsSeekWriter>> {
+        None
+    }
+
+    fn full(self: Arc<Self>) -> Option<Arc<dyn VfsFull>> {
+        None
+    }
+
+    async fn get_usage(&self) -> io::Result<Option<DataUsage>> {
+        Ok(None)
     }
 }
 
