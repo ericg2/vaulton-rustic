@@ -68,8 +68,6 @@ pub use crate::rclone::RcloneBackend;
 #[cfg(feature = "rest")]
 pub use crate::rest::RestBackend;
 
-pub use crate::arbhx::ArbhxBackend;
-
 // rustic_backend Public API
 pub use crate::repo_be::{BackendOptions};
 

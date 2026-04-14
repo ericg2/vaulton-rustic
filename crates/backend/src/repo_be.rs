@@ -5,8 +5,7 @@ use std::fmt::Debug;
 use std::{collections::BTreeMap, sync::Arc};
 
 use rustic_core::{ErrorKind, RepositoryBackends, RusticError, RusticResult, WriteBackend};
-
-use crate::ArbhxBackend;
+use crate::arbhx::ArbhxBackend;
 
 /// Options for a backend.
 #[derive(Clone, Default, Debug, Setters)]
@@ -14,10 +13,10 @@ use crate::ArbhxBackend;
 #[non_exhaustive]
 pub struct BackendOptions {
     /// Repository to use
-    pub repository: Option<Arc<dyn VfsBackend>>,
+    repository: Option<Arc<dyn VfsBackend>>,
 
     /// Repository to use as hot storage
-    pub repo_hot: Option<Arc<dyn VfsBackend>>,
+    repo_hot: Option<Arc<dyn VfsBackend>>,
 }
 
 impl BackendOptions {
@@ -71,22 +70,3 @@ impl BackendOptions {
         }
     }
 }
-//
-// /// Trait which can be implemented to choose a backend from a backend type, a backend path and options given as `HashMap`.
-// pub trait BackendChoice {
-//     /// Init backend from a path and options.
-//     ///
-//     /// # Arguments
-//     ///
-//     /// * `path` - The path to create that points to the backend.
-//     /// * `options` - additional options for creating the backend
-//     ///
-//     /// # Errors
-//     ///
-//     /// * If the backend is not supported.
-//     fn to_backend(
-//         &self,
-//         location: BackendLocation,
-//         options: Option<BTreeMap<String, String>>,
-//     ) -> RusticResult<Arc<dyn WriteBackend>>;
-// }
