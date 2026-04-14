@@ -71,6 +71,7 @@ use crate::vfs::{IdenticalSnapshot, Latest, OpenFile, Vfs, VfsRepo};
 #[cfg(feature = "clap")]
 use clap::ValueHint;
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 mod constants {
     /// Estimated item capacity used for cache in [`FullIndex`](super::FullIndex)
@@ -1714,6 +1715,7 @@ impl RepoIndexed {
             IdenticalSnapshot::AsDir,
         )?;
         Ok(VfsRepo {
+            id: Uuid::new_v4(),
             handle,
             vfs: Arc::new(vfs),
             repo: self.clone(),
