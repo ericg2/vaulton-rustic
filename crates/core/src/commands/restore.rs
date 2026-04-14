@@ -701,78 +701,78 @@ where
         }
     };
 
-    //pool.install(|| {
-    per_file.into_par_iter().for_each(|(file_idx, entries)| {
-        if token.is_cancelled() {
-            return;
-        }
-        let path = join_force(dest_path, &filenames[file_idx]);
-        let d_file = dest.ensure_file(&path).unwrap();
-        if dest.supports_random() {
-            // Random-write mode: write each blob directly at its intended offset
-            let mut handle = d_file.open_write_full().unwrap();
-            for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
-                entries
-            {
-                if token.is_cancelled() {
-                    return;
-                }
-                let data: Bytes = read_blob(
-                    from_file,
-                    &pack,
-                    blob_offset,
-                    blob_length,
-                    uncompressed_length,
-                );
-                let size = data.len() as u64;
-                trace!(
-                    "Random-writing {} bytes to {:?} at offset {}",
-                    size, path, file_start
-                );
-
-                handle.seek(SeekFrom::Start(file_start)).unwrap();
-                handle.write(&data).unwrap();
-                p.inc(size);
+    pool.install(|| {
+        per_file.into_par_iter().for_each(|(file_idx, entries)| {
+            if token.is_cancelled() {
+                return;
             }
-            handle.flush().unwrap();
-            handle.close().unwrap();
-        } else {
-            let mut expected_offset: u64 = 0;
-            let mut writer = d_file.open_write(true).unwrap();
-            for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
-                entries
-            {
-                if token.is_cancelled() {
-                    return;
-                }
-                if file_start != expected_offset {
-                    panic!(
-                        "Non-sequential restore detected for {:?}: expected {}, got {}",
-                        path, expected_offset, file_start
+            let path = join_force(dest_path, &filenames[file_idx]);
+            let d_file = dest.ensure_file(&path).unwrap();
+            if dest.supports_random() {
+                // Random-write mode: write each blob directly at its intended offset
+                let mut handle = d_file.open_write_full().unwrap();
+                for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
+                    entries
+                {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    let data: Bytes = read_blob(
+                        from_file,
+                        &pack,
+                        blob_offset,
+                        blob_length,
+                        uncompressed_length,
                     );
-                }
-                let data: Bytes = read_blob(
-                    from_file,
-                    &pack,
-                    blob_offset,
-                    blob_length,
-                    uncompressed_length,
-                );
-                let size = data.len() as u64;
-                trace!(
-                    "Writing {} bytes to {:?} (expected_offset={})",
-                    size, path, expected_offset
-                );
+                    let size = data.len() as u64;
+                    trace!(
+                        "Random-writing {} bytes to {:?} at offset {}",
+                        size, path, file_start
+                    );
 
-                writer.write_all(&data).unwrap();
-                expected_offset += size;
-                p.inc(size);
+                    handle.seek(SeekFrom::Start(file_start)).unwrap();
+                    handle.write(&data).unwrap();
+                    p.inc(size);
+                }
+                handle.flush().unwrap();
+                handle.close().unwrap();
+            } else {
+                let mut expected_offset: u64 = 0;
+                let mut writer = d_file.open_write(true).unwrap();
+                for (file_start, pack, blob_offset, blob_length, uncompressed_length, from_file) in
+                    entries
+                {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    if file_start != expected_offset {
+                        panic!(
+                            "Non-sequential restore detected for {:?}: expected {}, got {}",
+                            path, expected_offset, file_start
+                        );
+                    }
+                    let data: Bytes = read_blob(
+                        from_file,
+                        &pack,
+                        blob_offset,
+                        blob_length,
+                        uncompressed_length,
+                    );
+                    let size = data.len() as u64;
+                    trace!(
+                        "Writing {} bytes to {:?} (expected_offset={})",
+                        size, path, expected_offset
+                    );
+
+                    writer.write_all(&data).unwrap();
+                    expected_offset += size;
+                    p.inc(size);
+                }
+                writer.flush().unwrap();
+                writer.close().unwrap();
             }
-            writer.flush().unwrap();
-            writer.close().unwrap();
-        }
+        });
     });
-    //});
 
     token.ensure_good(&p)?;
     p.finish();
