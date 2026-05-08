@@ -3,7 +3,6 @@ use arbhx_core::VfsBackend;
 use derive_setters::Setters;
 use std::fmt::Debug;
 use std::{collections::BTreeMap, sync::Arc};
-use std::os::windows::io::HandleOrNull;
 use tokio::runtime::{Handle, Runtime};
 use rustic_core::{ErrorKind, RepositoryBackends, RusticError, RusticResult, WriteBackend};
 use crate::arbhx::ArbhxBackend;
