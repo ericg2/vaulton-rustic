@@ -174,6 +174,20 @@ impl From<RusticJobError> for tonic::Status {
     }
 }
 
+#[cfg(feature = "tonic")]
+impl From<Box<RusticError>> for tonic::Status {
+    fn from(value: Box<RusticError>) -> Self {
+        value.into()
+    }
+}
+
+#[cfg(feature = "tonic")]
+impl From<Box<RusticJobError>> for tonic::Status {
+    fn from(value: Box<RusticJobError>) -> Self {
+        value.into()
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 /// Errors that can result from rustic.
