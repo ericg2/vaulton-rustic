@@ -1,6 +1,6 @@
 [package]
 name = "rustic_core"
-version = "0.9.1"
+version = "0.9.2"
 authors = ["the rustic-rs team", "Eric E. Gold"]
 categories = ["data-structures", "encoding", "filesystem"]
 documentation = "https://docs.rs/rustic_core"
@@ -32,6 +32,7 @@ default = []
 cli = ["merge", "clap"]
 merge = ["dep:conflate"]
 clap = ["dep:clap"]
+tonic = ["dep:tonic"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -48,6 +49,8 @@ derive_setters = "0.1.8"
 
 # logging
 log = { workspace = true }
+
+tonic = { version = "0.14", optional = true }
 
 # parallelize
 crossbeam-channel = "0.5.15"

@@ -50,7 +50,12 @@
 
 use derive_more::derive::Display;
 use ecow::{EcoString, EcoVec};
-use std::{backtrace::{Backtrace, BacktraceStatus}, convert::Into, fmt::{self, Display}, io};
+use std::{
+    backtrace::{Backtrace, BacktraceStatus},
+    convert::Into,
+    fmt::{self, Display},
+    io,
+};
 
 pub(crate) mod constants {
     pub const DEFAULT_DOCS_URL: &str = "https://rustic.cli.rs/docs/errors/";
@@ -159,6 +164,16 @@ impl RusticJobError {
     }
 }
 
+#[cfg(feature = "tonic")]
+impl From<RusticJobError> for tonic::Status {
+    fn from(value: RusticJobError) -> Self {
+        match value {
+            RusticJobError::JobCancelled => tonic::Status::cancelled("Job has been cancelled."),
+            RusticJobError::JobError(err) => (*err).into(),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 /// Errors that can result from rustic.
@@ -200,6 +215,32 @@ pub struct RusticError {
     ///
     // Need to use option, otherwise thiserror will not be able to derive the Error trait.
     backtrace: Option<Backtrace>,
+}
+
+#[cfg(feature = "tonic")]
+impl From<RusticError> for tonic::Status {
+    fn from(value: RusticError) -> Self {
+        let source_msg = value.source.map(|e| format!(": {}", e)).unwrap_or_default();
+        let msg = format!("{}{}", value.kind, source_msg);
+        match value.kind {
+            ErrorKind::AppendOnly => tonic::Status::failed_precondition(msg),
+            ErrorKind::Backend => tonic::Status::internal(msg),
+            ErrorKind::Configuration => tonic::Status::invalid_argument(msg),
+            ErrorKind::Cryptography => tonic::Status::data_loss(msg),
+            ErrorKind::ExternalCommand => tonic::Status::internal(msg),
+            ErrorKind::Internal => tonic::Status::internal(msg),
+            ErrorKind::InvalidInput => tonic::Status::invalid_argument(msg),
+            ErrorKind::InputOutput => tonic::Status::unavailable(msg),
+            ErrorKind::Key => tonic::Status::permission_denied(msg),
+            ErrorKind::MissingInput => tonic::Status::invalid_argument(msg),
+            ErrorKind::Other => tonic::Status::unknown(msg),
+            ErrorKind::Password => tonic::Status::permission_denied(msg),
+            ErrorKind::Repository => tonic::Status::failed_precondition(msg),
+            ErrorKind::Unsupported => tonic::Status::unimplemented(msg),
+            ErrorKind::Verification => tonic::Status::unauthenticated(msg),
+            ErrorKind::Vfs => tonic::Status::internal(msg),
+        }
+    }
 }
 
 impl Display for RusticError {
